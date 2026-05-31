@@ -22,7 +22,8 @@ from datetime import datetime, timedelta
 # ══════════════════════════════════════════════════════
 #  CONFIG  —  modifie ici
 # ══════════════════════════════════════════════════════
-TOKEN        = "TON_TOKEN_ICI"   # ← remplace par ton token
+import os
+TOKEN = os.environ.get("TOKEN")
 DB_FILE      = "casino.db"
 
 XP_MIN       = 15      # XP min par message
