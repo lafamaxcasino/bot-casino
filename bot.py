@@ -1,23 +1,22 @@
 import discord
 from discord.ext import commands, tasks
-import json
 import os
 import random
 import asyncio
 import time
+import json
+import asyncpg
 from datetime import datetime, timedelta
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 PREFIX = "%"
-DATA_FILE = "data.json"
 
 # XP config
-XP_PER_MESSAGE = (5, 15)        # min, max XP par message
-XP_PER_MINUTE_VOCAL = 3         # XP par minute en vocal
-XP_MESSAGE_COOLDOWN = 60        # secondes entre deux gains de XP par message
+XP_PER_MESSAGE = (5, 15)
+XP_PER_MINUTE_VOCAL = 3
+XP_MESSAGE_COOLDOWN = 60
 
-# Niveaux → rôles (level requis : nom du rôle)
 LEVEL_ROLES = {
     5:   "Débutant du casino",
     15:  "Aventurier du casino",
@@ -26,14 +25,11 @@ LEVEL_ROLES = {
     100: "Légende du casino",
 }
 
-# Formule XP pour passer au niveau N : 100 * N^1.7
 def xp_for_level(level: int) -> int:
     return int(100 * (level ** 1.7))
 
-# Argent de départ
 STARTING_COINS = 200
 
-# Shop items
 SHOP_ITEMS = {
     "role_perso": {
         "name": "🎨 Rôle Personnalisé",
@@ -67,41 +63,82 @@ SHOP_ITEMS = {
     },
 }
 
-# ─── Data helpers ─────────────────────────────────────────────────────────────
+# ─── DB helpers ──────────────────────────────────────────────────────────────
 
-def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+db_pool: asyncpg.Pool = None
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(dsn=os.environ["DATABASE_URL"], min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id         BIGINT PRIMARY KEY,
+                xp              INTEGER   DEFAULT 0,
+                level           INTEGER   DEFAULT 0,
+                coins           INTEGER   DEFAULT 200,
+                last_message_xp FLOAT     DEFAULT 0,
+                last_daily      FLOAT     DEFAULT 0,
+                last_work       FLOAT     DEFAULT 0,
+                last_crime      FLOAT     DEFAULT 0,
+                last_rob        FLOAT     DEFAULT 0,
+                inventory       TEXT      DEFAULT '[]',
+                xp_boost_until  FLOAT     DEFAULT 0,
+                lucky_charm_until FLOAT   DEFAULT 0,
+                shield          BOOLEAN   DEFAULT FALSE,
+                daily_bonus_x2  BOOLEAN   DEFAULT FALSE,
+                vocal_start     FLOAT     DEFAULT 0,
+                casino_wins     INTEGER   DEFAULT 0,
+                casino_losses   INTEGER   DEFAULT 0,
+                total_earned    INTEGER   DEFAULT 200
+            )
+        """)
 
-def get_user(data: dict, user_id: int) -> dict:
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = {
-            "xp": 0,
-            "level": 0,
-            "coins": STARTING_COINS,
-            "last_message_xp": 0,
-            "last_daily": 0,
-            "last_work": 0,
-            "last_crime": 0,
-            "last_rob": 0,
-            "inventory": [],
-            "xp_boost_until": 0,
-            "lucky_charm_until": 0,
-            "shield": False,
-            "daily_bonus_x2": False,
-            "vocal_start": 0,
-            "casino_wins": 0,
-            "casino_losses": 0,
-            "total_earned": STARTING_COINS,
-        }
-    return data[uid]
+async def get_user(user_id: int) -> dict:
+    """Retourne le dict du user depuis la DB (le crée si inexistant)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+        if row is None:
+            await conn.execute("INSERT INTO users (user_id) VALUES ($1)", user_id)
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+        d = dict(row)
+        d["inventory"] = json.loads(d["inventory"])
+        return d
+
+async def save_user(user: dict):
+    """Sauvegarde le dict du user dans la DB."""
+    inv = json.dumps(user["inventory"])
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE users SET
+                xp=$2, level=$3, coins=$4,
+                last_message_xp=$5, last_daily=$6, last_work=$7,
+                last_crime=$8, last_rob=$9, inventory=$10,
+                xp_boost_until=$11, lucky_charm_until=$12,
+                shield=$13, daily_bonus_x2=$14, vocal_start=$15,
+                casino_wins=$16, casino_losses=$17, total_earned=$18
+            WHERE user_id=$1
+        """,
+            user["user_id"], user["xp"], user["level"], user["coins"],
+            user["last_message_xp"], user["last_daily"], user["last_work"],
+            user["last_crime"], user["last_rob"], inv,
+            user["xp_boost_until"], user["lucky_charm_until"],
+            user["shield"], user["daily_bonus_x2"], user["vocal_start"],
+            user["casino_wins"], user["casino_losses"], user["total_earned"]
+        )
+
+async def get_all_users() -> list[dict]:
+    """Retourne tous les users (pour classements)."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM users")
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["inventory"] = json.loads(d["inventory"])
+            result.append(d)
+        return result
+
+# ─── XP helpers ──────────────────────────────────────────────────────────────
 
 def compute_level(xp: int) -> int:
     level = 0
@@ -125,24 +162,23 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-vocal_sessions: dict[int, float] = {}  # user_id → timestamp d'entrée
+vocal_sessions: dict[int, float] = {}
 
 # ─── Events ──────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} est connecté !")
+    await init_db()
+    print(f"✅ {bot.user} connecté et base de données prête !")
     vocal_xp_loop.start()
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-    data = load_data()
-    user = get_user(data, message.author.id)
+    user = await get_user(message.author.id)
     now = time.time()
 
-    # Gain XP si cooldown écoulé
     if now - user["last_message_xp"] >= XP_MESSAGE_COOLDOWN:
         gain = random.randint(*XP_PER_MESSAGE)
         if user.get("xp_boost_until", 0) > now:
@@ -152,12 +188,10 @@ async def on_message(message: discord.Message):
         new_level = compute_level(user["xp"])
         if new_level > user["level"]:
             user["level"] = new_level
-            save_data(data)
+            await save_user(user)
             await handle_level_up(message.author, message.guild, new_level, message.channel)
         else:
-            save_data(data)
-    else:
-        save_data(data)
+            await save_user(user)
 
     await bot.process_commands(message)
 
@@ -173,10 +207,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @tasks.loop(minutes=1)
 async def vocal_xp_loop():
-    data = load_data()
     now = time.time()
-    for uid, start in list(vocal_sessions.items()):
-        user = get_user(data, uid)
+    for uid in list(vocal_sessions.keys()):
+        user = await get_user(uid)
         gain = XP_PER_MINUTE_VOCAL
         if user.get("xp_boost_until", 0) > now:
             gain *= 2
@@ -188,16 +221,14 @@ async def vocal_xp_loop():
                 member = guild.get_member(uid)
                 if member:
                     await handle_level_up(member, guild, new_level, None)
-    save_data(data)
+        await save_user(user)
 
 async def handle_level_up(member: discord.Member, guild: discord.Guild, new_level: int, channel):
-    # Attribution de rôle si palier atteint
     role_name = LEVEL_ROLES.get(new_level)
     role_msg = ""
     if role_name:
         role = discord.utils.get(guild.roles, name=role_name)
         if role:
-            # Retirer les anciens rôles casino
             for rn in LEVEL_ROLES.values():
                 old_role = discord.utils.get(guild.roles, name=rn)
                 if old_role and old_role in member.roles:
@@ -268,9 +299,7 @@ async def help_cmd(ctx):
 @bot.command(name="profil")
 async def profil(ctx, member: discord.Member = None):
     member = member or ctx.author
-    data = load_data()
-    user = get_user(data, member.id)
-    save_data(data)
+    user = await get_user(member.id)
     level = compute_level(user["xp"])
     current_xp, needed_xp = xp_progress(user["xp"], level)
     bar_len = 20
@@ -290,15 +319,13 @@ async def profil(ctx, member: discord.Member = None):
 
 @bot.command(name="solde", aliases=["balance", "coins"])
 async def solde(ctx):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
-    save_data(data)
+    user = await get_user(ctx.author.id)
     await ctx.send(f"💰 {ctx.author.mention} tu possèdes **{user['coins']:,}** 🪙")
 
 @bot.command(name="classement", aliases=["top", "leaderboard"])
 async def classement(ctx):
-    data = load_data()
-    scores = [(int(uid), d["xp"], compute_level(d["xp"])) for uid, d in data.items()]
+    all_users = await get_all_users()
+    scores = [(u["user_id"], u["xp"], compute_level(u["xp"])) for u in all_users]
     scores.sort(key=lambda x: x[1], reverse=True)
     embed = discord.Embed(title="🏆 Top 10 — XP", color=0xFFD700)
     medals = ["🥇","🥈","🥉"] + ["🎖️"]*7
@@ -312,8 +339,8 @@ async def classement(ctx):
 
 @bot.command(name="richesse")
 async def richesse(ctx):
-    data = load_data()
-    scores = [(int(uid), d["coins"]) for uid, d in data.items()]
+    all_users = await get_all_users()
+    scores = [(u["user_id"], u["coins"]) for u in all_users]
     scores.sort(key=lambda x: x[1], reverse=True)
     embed = discord.Embed(title="💰 Top 10 — Richesse", color=0x2ECC71)
     medals = ["🥇","🥈","🥉"] + ["🎖️"]*7
@@ -329,8 +356,7 @@ async def richesse(ctx):
 
 @bot.command(name="daily")
 async def daily(ctx):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     now = time.time()
     cooldown = 86400
     if now - user["last_daily"] < cooldown:
@@ -347,12 +373,11 @@ async def daily(ctx):
         await ctx.send(f"🎁 Daily récupéré ! Tu reçois **{amount:,}** 🪙 !")
     user["coins"] += amount
     user["last_daily"] = now
-    save_data(data)
+    await save_user(user)
 
 @bot.command(name="work")
 async def work(ctx):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     now = time.time()
     cooldown = 1800
     if now - user["last_work"] < cooldown:
@@ -371,13 +396,12 @@ async def work(ctx):
     amount = random.randint(mn, mx)
     user["coins"] += amount
     user["last_work"] = now
-    save_data(data)
+    await save_user(user)
     await ctx.send(f"{job} — Tu gagnes **{amount}** 🪙 !")
 
 @bot.command(name="crime")
 async def crime(ctx):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     now = time.time()
     cooldown = 3600
     if now - user["last_crime"] < cooldown:
@@ -389,11 +413,11 @@ async def crime(ctx):
     if random.random() < 0.35:
         fine = random.randint(100, 400)
         user["coins"] = max(0, user["coins"] - fine)
-        save_data(data)
+        await save_user(user)
         return await ctx.send(f"🚔 Tu t'es fait attraper ! Amende de **{fine}** 🪙.")
     amount = random.randint(200, 600)
     user["coins"] += amount
-    save_data(data)
+    await save_user(user)
     crimes = ["🏦 Braquage de banque", "💎 Vol de bijoux", "🎭 Arnaque à l'arnaque", "🖥️ Piratage informatique"]
     await ctx.send(f"{random.choice(crimes)} réussi ! Tu gagnes **{amount}** 🪙 !")
 
@@ -401,9 +425,8 @@ async def crime(ctx):
 async def rob(ctx, target: discord.Member):
     if target.bot or target.id == ctx.author.id:
         return await ctx.send("❌ Cible invalide.")
-    data = load_data()
-    robber = get_user(data, ctx.author.id)
-    victim = get_user(data, target.id)
+    robber = await get_user(ctx.author.id)
+    victim = await get_user(target.id)
     now = time.time()
     cooldown = 7200
     if now - robber.get("last_rob", 0) < cooldown:
@@ -414,7 +437,8 @@ async def rob(ctx, target: discord.Member):
     if victim.get("shield"):
         victim["shield"] = False
         robber["last_rob"] = now
-        save_data(data)
+        await save_user(victim)
+        await save_user(robber)
         return await ctx.send(f"🛡️ {target.display_name} était protégé par un bouclier ! Vol annulé.")
     if victim["coins"] < 50:
         return await ctx.send(f"💸 {target.display_name} n'a pas assez de coins à voler.")
@@ -422,12 +446,13 @@ async def rob(ctx, target: discord.Member):
     if random.random() < 0.4:
         fine = random.randint(50, 200)
         robber["coins"] = max(0, robber["coins"] - fine)
-        save_data(data)
+        await save_user(robber)
         return await ctx.send(f"🚔 {ctx.author.mention} s'est fait attraper ! Amende de **{fine}** 🪙.")
     stolen = random.randint(50, min(300, victim["coins"] // 2))
     victim["coins"] -= stolen
     robber["coins"] += stolen
-    save_data(data)
+    await save_user(robber)
+    await save_user(victim)
     await ctx.send(f"🦹 {ctx.author.mention} vole **{stolen}** 🪙 à {target.mention} !")
 
 # ─── Casino ───────────────────────────────────────────────────────────────────
@@ -443,47 +468,39 @@ def parse_bet(user: dict, arg: str) -> int | None:
 
 @bot.command(name="slot", aliases=["slots"])
 async def slot(ctx, mise: str = "0"):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     bet = parse_bet(user, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Mise minimum : **10** 🪙. Usage : `%slot <mise>`")
     if bet > user["coins"]:
         return await ctx.send("❌ Tu n'as pas assez de coins.")
     symbols = ["🍒", "🍋", "🍊", "🍇", "🔔", "⭐", "💎", "7️⃣"]
-    weights = [20, 18, 15, 12, 10, 8, 5, 3]  # pondération
+    weights = [20, 18, 15, 12, 10, 8, 5, 3]
     reels = random.choices(symbols, weights=weights, k=3)
     result_str = " | ".join(reels)
     if reels[0] == reels[1] == reels[2]:
-        if reels[0] == "7️⃣":
-            mult = 20
-        elif reels[0] == "💎":
-            mult = 10
-        elif reels[0] == "⭐":
-            mult = 7
-        elif reels[0] == "🔔":
-            mult = 5
-        else:
-            mult = 3
+        if reels[0] == "7️⃣": mult = 20
+        elif reels[0] == "💎": mult = 10
+        elif reels[0] == "⭐": mult = 7
+        elif reels[0] == "🔔": mult = 5
+        else: mult = 3
         win = bet * mult
         user["coins"] += win - bet
         user["casino_wins"] += 1
         msg = f"🎰 {result_str}\n🎉 JACKPOT x{mult} ! Tu gagnes **{win:,}** 🪙 !"
     elif reels[0] == reels[1] or reels[1] == reels[2]:
-        win = bet
-        user["coins"] += win - bet
+        user["coins"] += 0
         msg = f"🎰 {result_str}\n✅ Deux identiques ! Mise récupérée : **{bet:,}** 🪙."
     else:
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
         msg = f"🎰 {result_str}\n❌ Perdu ! Tu perds **{bet:,}** 🪙."
-    save_data(data)
+    await save_user(user)
     await ctx.send(msg)
 
 @bot.command(name="coinflip", aliases=["cf", "flip"])
 async def coinflip(ctx, mise: str = "0", choix: str = "pile"):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     bet = parse_bet(user, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Mise minimum : 10. Usage : `%coinflip <mise> <pile|face>`")
@@ -502,13 +519,12 @@ async def coinflip(ctx, mise: str = "0", choix: str = "pile"):
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
         msg = f"{icon} **{result.capitalize()}** ! Tu perds **{bet:,}** 🪙."
-    save_data(data)
+    await save_user(user)
     await ctx.send(msg)
 
 @bot.command(name="blackjack", aliases=["bj"])
 async def blackjack(ctx, mise: str = "0"):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     bet = parse_bet(user, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Mise minimum : 10. Usage : `%blackjack <mise>`")
@@ -532,7 +548,6 @@ async def blackjack(ctx, mise: str = "0"):
     ranks = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"]
     deck = [r+s for r in ranks for s in suits]
     random.shuffle(deck)
-
     player = [deck.pop(), deck.pop()]
     dealer = [deck.pop(), deck.pop()]
 
@@ -548,7 +563,7 @@ async def blackjack(ctx, mise: str = "0"):
             f"Croupier : {d_display}"
         )
 
-    msg = await ctx.send(show_hands() + "\n\nTape `hit` pour tirer, `stand` pour rester.")
+    await ctx.send(show_hands() + "\n\nTape `hit` pour tirer, `stand` pour rester.")
 
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("hit","stand","h","s")
@@ -565,11 +580,10 @@ async def blackjack(ctx, mise: str = "0"):
         if hand_value(player) > 21:
             user["coins"] = max(0, user["coins"] - bet)
             user["casino_losses"] += 1
-            save_data(data)
+            await save_user(user)
             return await ctx.send(show_hands(False) + "\n💥 **Bust !** Tu perds **{:,}** 🪙.".format(bet))
         await ctx.send(show_hands())
 
-    # Croupier joue
     while hand_value(dealer) < 17:
         dealer.append(deck.pop())
 
@@ -584,13 +598,12 @@ async def blackjack(ctx, mise: str = "0"):
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
         result = f"❌ Défaite ! Tu perds **{bet:,}** 🪙."
-    save_data(data)
+    await save_user(user)
     await ctx.send(show_hands(False) + f"\n{result}")
 
 @bot.command(name="roulette")
 async def roulette(ctx, mise: str = "0", choix: str = "rouge"):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     bet = parse_bet(user, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Usage : `%roulette <mise> <rouge|noir|pair|impair|0-36>`")
@@ -619,16 +632,15 @@ async def roulette(ctx, mise: str = "0", choix: str = "rouge"):
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
         msg = f"🎡 La bille tombe sur **{num}** ({color}) !\n❌ Perdu ! -**{bet:,}** 🪙"
-    save_data(data)
+    await save_user(user)
     await ctx.send(msg)
 
 @bot.command(name="dice", aliases=["de"])
 async def dice(ctx, mise: str = "0"):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     bet = parse_bet(user, mise)
     if not bet or bet < 10:
-        return await ctx.send("❌ Usage : `%dice <mise>` — Tu dois faire plus de 3 avec deux dés.")
+        return await ctx.send("❌ Usage : `%dice <mise>` — Tu dois faire plus de 7 avec deux dés.")
     if bet > user["coins"]:
         return await ctx.send("❌ Pas assez de coins.")
     d1, d2 = random.randint(1,6), random.randint(1,6)
@@ -643,7 +655,7 @@ async def dice(ctx, mise: str = "0"):
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
         msg = f"🎲 {d1} + {d2} = **{total}** ! ❌ Tu perds **{bet:,}** 🪙."
-    save_data(data)
+    await save_user(user)
     await ctx.send(msg)
 
 # ─── Mini-jeux ────────────────────────────────────────────────────────────────
@@ -672,8 +684,7 @@ async def trivia(ctx):
     await ctx.send(embed=embed)
 
     def check(m):
-        if m.author != ctx.author or m.channel != ctx.channel:
-            return False
+        if m.author != ctx.author or m.channel != ctx.channel: return False
         ans = m.content.strip().lower()
         try:
             idx = int(ans) - 1
@@ -694,12 +705,11 @@ async def trivia(ctx):
         given = ans
 
     if q["a"].lower() in given or given in q["a"].lower():
-        data = load_data()
-        user = get_user(data, ctx.author.id)
+        user = await get_user(ctx.author.id)
         user["coins"] += reward
         xp_gain = 20
         user["xp"] += xp_gain
-        save_data(data)
+        await save_user(user)
         await ctx.send(f"✅ Bonne réponse ! +**{reward}** 🪙 et +**{xp_gain}** XP !")
     else:
         await ctx.send(f"❌ Mauvaise réponse ! C'était **{q['a'].title()}**.")
@@ -708,9 +718,8 @@ async def trivia(ctx):
 async def rps(ctx, target: discord.Member, mise: str = "0"):
     if target.bot or target.id == ctx.author.id:
         return await ctx.send("❌ Cible invalide.")
-    data = load_data()
-    challenger = get_user(data, ctx.author.id)
-    opponent = get_user(data, target.id)
+    challenger = await get_user(ctx.author.id)
+    opponent = await get_user(target.id)
     bet = parse_bet(challenger, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Mise minimum : 10. Usage : `%rps @user <mise>`")
@@ -720,7 +729,6 @@ async def rps(ctx, target: discord.Member, mise: str = "0"):
         return await ctx.send(f"❌ {target.display_name} n'a pas assez de coins.")
 
     await ctx.send(f"⚔️ {target.mention}, {ctx.author.mention} te défie en Pierre-Feuille-Ciseaux pour **{bet:,}** 🪙 ! Acceptes-tu ? (oui/non)")
-
     def check_accept(m):
         return m.author == target and m.channel == ctx.channel and m.content.lower() in ("oui","non","yes","no")
     try:
@@ -762,16 +770,16 @@ async def rps(ctx, target: discord.Member, mise: str = "0"):
         opponent["coins"] += bet; challenger["coins"] = max(0, challenger["coins"] - bet)
         opponent["casino_wins"] += 1
         result = f"🏆 {target.mention} gagne **{bet:,}** 🪙 !"
-    save_data(data)
+    await save_user(challenger)
+    await save_user(opponent)
     await ctx.send(f"{ctx.author.display_name} : {e1} vs {target.display_name} : {e2}\n{result}")
 
 @bot.command(name="duel")
 async def duel(ctx, target: discord.Member, mise: str = "0"):
     if target.bot or target.id == ctx.author.id:
         return await ctx.send("❌ Cible invalide.")
-    data = load_data()
-    challenger = get_user(data, ctx.author.id)
-    opponent = get_user(data, target.id)
+    challenger = await get_user(ctx.author.id)
+    opponent = await get_user(target.id)
     bet = parse_bet(challenger, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Mise minimum : 10. Usage : `%duel @user <mise>`")
@@ -797,13 +805,13 @@ async def duel(ctx, target: discord.Member, mise: str = "0"):
     else:
         opponent["coins"] += bet; challenger["coins"] = max(0, challenger["coins"] - bet)
         result = f"🏆 {target.mention} (**{r2}**) bat {ctx.author.mention} (**{r1}**) ! +**{bet:,}** 🪙"
-    save_data(data)
+    await save_user(challenger)
+    await save_user(opponent)
     await ctx.send(result)
 
 @bot.command(name="mines")
 async def mines(ctx, mise: str = "0", cases: int = 3):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     bet = parse_bet(user, mise)
     if not bet or bet < 10:
         return await ctx.send("❌ Usage : `%mines <mise> <nb_mines 1-8>`")
@@ -824,7 +832,7 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
             if (i+1) % 3 == 0: out += "\n"
         return out
 
-    msg = await ctx.send(
+    await ctx.send(
         f"💣 **Mines** ({cases} mines) — Mise : {bet:,} 🪙\n{grid_display()}\n"
         f"Tape un numéro (1-9) pour révéler une case, ou `stop` pour encaisser.\nMultiplicateur actuel : x**{mult:.2f}**"
     )
@@ -849,7 +857,7 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         if idx in mine_positions:
             user["coins"] = max(0, user["coins"] - bet)
             user["casino_losses"] += 1
-            save_data(data)
+            await save_user(user)
             return await ctx.send(f"💥 MINE ! {grid_display()}\n❌ Tu perds **{bet:,}** 🪙.")
         safe = total - cases
         mult = round(1 + (len(revealed) / safe) * (cases * 0.8), 2)
@@ -859,7 +867,7 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
     gain = win - bet
     user["coins"] += gain
     if gain >= 0: user["casino_wins"] += 1
-    save_data(data)
+    await save_user(user)
     await ctx.send(f"🏁 {grid_display()}\n💰 Encaissé ! x{mult:.2f} → **{win:,}** 🪙 (+**{gain:,}**)")
 
 @bot.command(name="course")
@@ -892,13 +900,11 @@ async def course(ctx):
             break
         parts = resp.content.strip().split()
         horse_idx, bet_amt = int(parts[0]) - 1, int(parts[1])
-        data = load_data()
-        user = get_user(data, resp.author.id)
+        user = await get_user(resp.author.id)
         if bet_amt > user["coins"]:
             await ctx.send(f"❌ {resp.author.mention} n'a pas assez de coins."); continue
         bets[resp.author.id] = (horse_idx, bet_amt)
         await ctx.send(f"✅ {resp.author.mention} mise **{bet_amt}** 🪙 sur **{horses[horse_idx]}** !")
-        save_data(data)
 
     if not bets:
         return await ctx.send("🏇 Aucun pari — course annulée.")
@@ -910,9 +916,8 @@ async def course(ctx):
     winner_idx = positions[0]
 
     result_lines = [f"🏆 Gagnant : **{horses[winner_idx]}** !"]
-    data = load_data()
     for uid, (hidx, bet_amt) in bets.items():
-        user = get_user(data, uid)
+        user = await get_user(uid)
         member = ctx.guild.get_member(uid)
         name = member.display_name if member else str(uid)
         if hidx == winner_idx:
@@ -924,7 +929,7 @@ async def course(ctx):
             user["coins"] = max(0, user["coins"] - bet_amt)
             user["casino_losses"] += 1
             result_lines.append(f"❌ {name} : -**{bet_amt:,}** 🪙")
-    save_data(data)
+        await save_user(user)
     await ctx.send("\n".join(result_lines))
 
 # ─── Shop ─────────────────────────────────────────────────────────────────────
@@ -945,8 +950,7 @@ async def buy(ctx, item_key: str = ""):
     if item_key not in SHOP_ITEMS:
         return await ctx.send(f"❌ Item invalide. Utilise `%shop` pour voir les items disponibles.")
     item = SHOP_ITEMS[item_key]
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     if user["coins"] < item["price"]:
         return await ctx.send(f"❌ Tu n'as pas assez de coins. (Besoin : {item['price']:,} 🪙, Tu as : {user['coins']:,} 🪙)")
 
@@ -975,21 +979,19 @@ async def buy(ctx, item_key: str = ""):
             role = await ctx.guild.create_role(name=rn.content.strip()[:50], color=color, reason=f"Shop — {ctx.author}")
             await ctx.author.add_roles(role)
             user["coins"] -= item["price"]
-            save_data(data)
+            await save_user(user)
             await ctx.send(f"✅ Rôle **{role.name}** créé et attribué !")
         except discord.Forbidden:
             return await ctx.send("❌ Je n'ai pas la permission de créer des rôles.")
     else:
         user["coins"] -= item["price"]
         user["inventory"].append(item_key)
-        save_data(data)
+        await save_user(user)
         await ctx.send(f"✅ Tu as acheté **{item['name']}** ! Utilise `%use {item_key}` pour l'activer.")
 
 @bot.command(name="inventaire", aliases=["inv", "inventory"])
 async def inventaire(ctx):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
-    save_data(data)
+    user = await get_user(ctx.author.id)
     if not user["inventory"]:
         return await ctx.send("🎒 Ton inventaire est vide.")
     embed = discord.Embed(title=f"🎒 Inventaire de {ctx.author.display_name}", color=0x9B59B6)
@@ -1003,12 +1005,10 @@ async def inventaire(ctx):
 
 @bot.command(name="use", aliases=["utiliser"])
 async def use(ctx, item_key: str = ""):
-    data = load_data()
-    user = get_user(data, ctx.author.id)
+    user = await get_user(ctx.author.id)
     if item_key not in user["inventory"]:
         return await ctx.send("❌ Tu ne possèdes pas cet item.")
     now = time.time()
-    item = SHOP_ITEMS.get(item_key)
     if item_key == "xp_boost_1h":
         user["xp_boost_until"] = now + 3600
         msg = "⚡ Boost XP x2 activé pour 1 heure !"
@@ -1024,7 +1024,7 @@ async def use(ctx, item_key: str = ""):
     else:
         msg = "❌ Cet item ne peut pas être utilisé manuellement."
     user["inventory"].remove(item_key)
-    save_data(data)
+    await save_user(user)
     await ctx.send(msg)
 
 # ─── Error handler ────────────────────────────────────────────────────────────
