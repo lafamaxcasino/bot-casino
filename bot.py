@@ -13,9 +13,9 @@ PREFIX = "%"
 DATA_FILE = "data.json"
 
 # XP config
-XP_PER_MESSAGE = (3, 10)        # min, max XP par message (réduit)
-XP_PER_MINUTE_VOCAL = 2         # XP par minute en vocal (réduit)
-XP_MESSAGE_COOLDOWN = 90        # secondes entre deux gains de XP (augmenté)
+XP_PER_MESSAGE = (3, 10)
+XP_PER_MINUTE_VOCAL = 2
+XP_MESSAGE_COOLDOWN = 90
 
 # Couleurs embed
 COLOR_GOLD    = 0xF1C40F
@@ -26,6 +26,7 @@ COLOR_PURPLE  = 0x9B59B6
 COLOR_ORANGE  = 0xE67E22
 COLOR_DARK    = 0x2C2F33
 COLOR_CASINO  = 0xFF6B35
+COLOR_TEAL    = 0x1ABC9C
 
 # Niveaux → rôles
 LEVEL_ROLES = {
@@ -39,7 +40,7 @@ LEVEL_ROLES = {
 def xp_for_level(level: int) -> int:
     return int(100 * (level ** 1.7))
 
-STARTING_COINS = 100  # réduit de 200 à 100
+STARTING_COINS = 100
 
 SHOP_ITEMS = {
     "role_perso": {
@@ -86,6 +87,49 @@ SHOP_ITEMS = {
     },
 }
 
+# ─── Cartes visuelles ─────────────────────────────────────────────────────────
+# Rendu ASCII multi-ligne d'une carte à jouer
+
+SUIT_COLORS = {"♠": "♠", "♣": "♣", "♥": "♥", "♦": "♦"}
+
+def render_card(rank: str, suit: str) -> list[str]:
+    """Retourne une carte ASCII sous forme de liste de lignes."""
+    r = rank.ljust(2)
+    rb = rank.rjust(2)
+    s = suit
+    return [
+        "┌─────┐",
+        f"│{r}   │",
+        f"│  {s}  │",
+        f"│   {rb}│",
+        "└─────┘",
+    ]
+
+def render_card_back() -> list[str]:
+    return [
+        "┌─────┐",
+        "│░░░░░│",
+        "│░░░░░│",
+        "│░░░░░│",
+        "└─────┘",
+    ]
+
+def render_hand(cards: list[str], hide_last: bool = False) -> str:
+    """Assemble plusieurs cartes côte à côte en ASCII."""
+    rendered = []
+    for i, card in enumerate(cards):
+        rank = card[:-1]
+        suit = card[-1]
+        if hide_last and i == len(cards) - 1:
+            rendered.append(render_card_back())
+        else:
+            rendered.append(render_card(rank, suit))
+    # Coller côte à côte
+    lines = []
+    for row in range(5):
+        lines.append("  ".join(c[row] for c in rendered))
+    return "```\n" + "\n".join(lines) + "\n```"
+
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 
 def load_data() -> dict:
@@ -110,6 +154,7 @@ def get_user(data: dict, user_id: int) -> dict:
             "last_work": 0,
             "last_crime": 0,
             "last_rob": 0,
+            "last_cadeau": 0,
             "inventory": [],
             "xp_boost_until": 0,
             "lucky_charm_until": 0,
@@ -124,17 +169,38 @@ def get_user(data: dict, user_id: int) -> dict:
             "streak_daily": 0,
             "last_daily_streak": 0,
             "total_games_played": 0,
+            # Banque
+            "bank": 0,
+            # Prêt
+            "loan_amount": 0,
+            "loan_due": 0,
+            # Investissement
+            "invest_amount": 0,
+            "invest_due": 0,
+            # Historique (10 dernières transactions)
+            "history": [],
+            # Palmarès
+            "best_jackpot": 0,
+            "best_rob": 0,
         }
-    # Migrations pour anciens profils
     defaults = {
         "vip_until": 0, "insurance": False,
         "streak_daily": 0, "last_daily_streak": 0,
-        "total_games_played": 0, "total_earned": STARTING_COINS
+        "total_games_played": 0, "total_earned": STARTING_COINS,
+        "bank": 0, "loan_amount": 0, "loan_due": 0,
+        "invest_amount": 0, "invest_due": 0,
+        "history": [], "best_jackpot": 0, "best_rob": 0,
+        "last_cadeau": 0,
     }
     for k, v in defaults.items():
         if k not in data[uid]:
             data[uid][k] = v
     return data[uid]
+
+def add_history(user: dict, label: str, amount: int):
+    entry = {"label": label, "amount": amount, "ts": int(time.time())}
+    user["history"].insert(0, entry)
+    user["history"] = user["history"][:10]
 
 def compute_level(xp: int) -> int:
     level = 0
@@ -150,7 +216,6 @@ def xp_progress(xp: int, level: int) -> tuple:
     return xp, needed
 
 def get_cooldown_mult(user: dict) -> float:
-    """Retourne le multiplicateur de cooldown (0.5 si VIP actif)"""
     if user.get("vip_until", 0) > time.time():
         return 0.5
     return 1.0
@@ -168,6 +233,15 @@ def format_time(seconds: float) -> str:
         return f"{h}h {m:02d}m"
     return f"{m}m {s2:02d}s"
 
+def parse_bet(user: dict, arg: str) -> int | None:
+    if arg.lower() in ("all", "tout"):
+        return user["coins"]
+    try:
+        v = int(arg)
+        return v if v > 0 else None
+    except:
+        return None
+
 # ─── Bot setup ────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -179,6 +253,43 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 vocal_sessions: dict[int, float] = {}
 
+# État global pour le marché noir
+blackmarket_state = {
+    "last_refresh": 0,
+    "items": [],
+    "stocks": {},
+}
+
+BLACKMARKET_POOL = [
+    {"key": "xp_boost_1h",  "name": "⚡ Boost XP",       "base_price": 1200, "emoji": "⚡"},
+    {"key": "shield",        "name": "🛡️ Bouclier",       "base_price": 600,  "emoji": "🛡️"},
+    {"key": "lucky_charm",   "name": "🍀 Porte-bonheur",  "base_price": 2000, "emoji": "🍀"},
+    {"key": "daily_bonus",   "name": "🎁 Bonus Daily x2", "base_price": 900,  "emoji": "🎁"},
+    {"key": "vip_pass",      "name": "💎 Pass VIP",        "base_price": 3500, "emoji": "💎"},
+    {"key": "insurance",     "name": "🔒 Assurance",       "base_price": 1500, "emoji": "🔒"},
+]
+
+def refresh_blackmarket():
+    now = time.time()
+    if now - blackmarket_state["last_refresh"] < 21600:  # 6h
+        return
+    chosen = random.sample(BLACKMARKET_POOL, k=random.randint(3, 5))
+    blackmarket_state["items"] = []
+    blackmarket_state["stocks"] = {}
+    for item in chosen:
+        discount = random.randint(20, 50)
+        price = int(item["base_price"] * (1 - discount / 100))
+        stock = random.randint(1, 5)
+        blackmarket_state["items"].append({
+            "key": item["key"],
+            "name": item["name"],
+            "emoji": item["emoji"],
+            "price": price,
+            "discount": discount,
+        })
+        blackmarket_state["stocks"][item["key"]] = stock
+    blackmarket_state["last_refresh"] = now
+
 # ─── Events ──────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -186,6 +297,10 @@ async def on_ready():
     print(f"✅ {bot.user} est connecté !")
     if not vocal_xp_loop.is_running():
         vocal_xp_loop.start()
+    if not check_loans_loop.is_running():
+        check_loans_loop.start()
+    if not check_invest_loop.is_running():
+        check_invest_loop.start()
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -242,6 +357,40 @@ async def vocal_xp_loop():
                     await handle_level_up(member, guild, new_level, None)
     save_data(data)
 
+@tasks.loop(minutes=10)
+async def check_loans_loop():
+    """Pénalise les joueurs qui n'ont pas remboursé leur prêt à temps."""
+    data = load_data()
+    now = time.time()
+    for uid, udata in data.items():
+        if udata.get("loan_amount", 0) > 0 and udata.get("loan_due", 0) < now:
+            penalty = int(udata["loan_amount"] * 1.5)
+            udata["coins"] = max(0, udata["coins"] - penalty)
+            udata["loan_amount"] = 0
+            udata["loan_due"] = 0
+            add_history(udata, "💸 Pénalité prêt impayé", -penalty)
+    save_data(data)
+
+@tasks.loop(minutes=5)
+async def check_invest_loop():
+    """Résout les investissements arrivés à échéance."""
+    data = load_data()
+    now = time.time()
+    for uid, udata in data.items():
+        if udata.get("invest_amount", 0) > 0 and udata.get("invest_due", 0) <= now:
+            amt = udata["invest_amount"]
+            mult = random.uniform(-0.30, 0.80)
+            gain = int(amt * mult)
+            udata["coins"] += amt + gain
+            if gain >= 0:
+                udata["total_earned"] = udata.get("total_earned", 0) + gain
+                add_history(udata, f"📈 Investissement +{gain:,}", gain)
+            else:
+                add_history(udata, f"📉 Investissement {gain:,}", gain)
+            udata["invest_amount"] = 0
+            udata["invest_due"] = 0
+    save_data(data)
+
 async def handle_level_up(member, guild, new_level: int, channel):
     role_name = LEVEL_ROLES.get(new_level)
     role_msg = ""
@@ -291,7 +440,10 @@ async def help_cmd(ctx):
         "`%profil [@user]` • Voir un profil\n"
         "`%classement` • Top 10 XP\n"
         "`%richesse` • Top 10 coins\n"
-        "`%stats` • Statistiques détaillées"
+        "`%stats` • Statistiques détaillées\n"
+        "`%palmares` • Records du serveur\n"
+        "`%historique` • Tes 10 dernières transactions\n"
+        "`%cooldowns` • Voir tes cooldowns"
     ), inline=True)
     embed.add_field(name="💰  Économie", value=(
         "`%daily` • Bonus journalier (24h)\n"
@@ -299,7 +451,12 @@ async def help_cmd(ctx):
         "`%crime` • Crime risqué (90min)\n"
         "`%rob @user` • Voler (3h)\n"
         "`%transfer @user <montant>` • Transférer\n"
-        "`%solde` • Voir tes coins"
+        "`%cadeau @user <montant>` • Offrir sans taxe\n"
+        "`%solde` • Voir tes coins\n"
+        "`%banque <dep|ret|solde> [montant]` • Banque\n"
+        "`%pret <montant>` • Emprunter des coins\n"
+        "`%rembourser` • Rembourser ton prêt\n"
+        "`%investir <montant>` • Investir (6h)"
     ), inline=True)
     embed.add_field(name="━━━━━━━━━━━━━━━━━━━━", value="", inline=False)
     embed.add_field(name="🎰  Casino", value=(
@@ -308,22 +465,30 @@ async def help_cmd(ctx):
         "`%blackjack <mise>` • Blackjack\n"
         "`%roulette <mise> <choix>` • Roulette\n"
         "`%dice <mise>` • Duel de dés\n"
-        "`%crash <mise>` • Crash (enchères)"
+        "`%crash <mise>` • Crash\n"
+        "`%plinko <mise>` • Plinko\n"
+        "`%highlow <mise>` • Plus haut / Plus bas\n"
+        "`%poker <mise>` • Video Poker"
     ), inline=True)
     embed.add_field(name="🎮  Mini-jeux", value=(
         "`%trivia` • Culture générale\n"
+        "`%quiz <catégorie>` • Quiz par catégorie\n"
         "`%rps @user <mise>` • Pierre-Feuille-Ciseaux\n"
         "`%duel @user <mise>` • Duel\n"
+        "`%duel_poker @user <mise>` • Poker duel\n"
         "`%mines <mise> <nb_mines>` • Démineur\n"
         "`%course` • Course de chevaux\n"
-        "`%wordgame` • Jeu de mots (solo)"
+        "`%wordgame` • Jeu de mots\n"
+        "`%memory` • Mémorisation"
     ), inline=True)
     embed.add_field(name="━━━━━━━━━━━━━━━━━━━━", value="", inline=False)
-    embed.add_field(name="🛒  Shop", value=(
-        "`%shop` • Voir le magasin\n"
+    embed.add_field(name="🛒  Shop & Marché", value=(
+        "`%shop` • Boutique officielle\n"
         "`%buy <item>` • Acheter\n"
         "`%inventaire` • Mon inventaire\n"
-        "`%use <item>` • Utiliser un item"
+        "`%use <item>` • Utiliser un item\n"
+        "`%blackmarket` • Marché noir (refresh 6h)\n"
+        "`%objectif` • Objectifs journaliers"
     ), inline=False)
     embed.set_footer(text="💡 Utilise %profil pour voir ton niveau et ta progression")
     await ctx.send(embed=embed)
@@ -348,7 +513,6 @@ async def profil(ctx, member: discord.Member = None):
     total = wins + losses
     wr = f"{int(wins/total*100)}%" if total else "N/A"
 
-    # Badges actifs
     badges = []
     now = time.time()
     if user.get("xp_boost_until", 0) > now: badges.append("⚡ Boost XP")
@@ -357,14 +521,12 @@ async def profil(ctx, member: discord.Member = None):
     if user.get("vip_until", 0) > now: badges.append("💎 VIP")
     if user.get("insurance"): badges.append("🔒 Assurance")
 
-    embed = discord.Embed(
-        title=f"🎰  Profil de {member.display_name}",
-        color=COLOR_GOLD
-    )
+    embed = discord.Embed(title=f"🎰  Profil de {member.display_name}", color=COLOR_GOLD)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="📊 Niveau", value=f"**{level}**", inline=True)
     embed.add_field(name="⭐ XP Total", value=f"**{user['xp']:,}**", inline=True)
     embed.add_field(name="💰 Coins", value=f"**{user['coins']:,}** 🪙", inline=True)
+    embed.add_field(name="🏦 Banque", value=f"**{user.get('bank',0):,}** 🪙", inline=True)
     embed.add_field(
         name=f"Progression  {pct}%",
         value=f"{bar}\n`{current_xp:,} / {needed_xp:,} XP`",
@@ -394,10 +556,7 @@ async def stats(ctx, member: discord.Member = None):
     total = wins + losses
     wr = f"{int(wins/total*100)}%" if total else "N/A"
 
-    embed = discord.Embed(
-        title=f"📈  Statistiques — {member.display_name}",
-        color=COLOR_BLUE
-    )
+    embed = discord.Embed(title=f"📈  Statistiques — {member.display_name}", color=COLOR_BLUE)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="🏆 Victoires casino", value=f"**{wins:,}**", inline=True)
     embed.add_field(name="💔 Défaites casino", value=f"**{losses:,}**", inline=True)
@@ -405,6 +564,8 @@ async def stats(ctx, member: discord.Member = None):
     embed.add_field(name="🎮 Parties jouées", value=f"**{user.get('total_games_played',0):,}**", inline=True)
     embed.add_field(name="💵 Total gagné (vie)", value=f"**{user.get('total_earned',0):,}** 🪙", inline=True)
     embed.add_field(name="🔥 Streak daily", value=f"**{user.get('streak_daily',0)}** jours", inline=True)
+    embed.add_field(name="🏅 Meilleur jackpot", value=f"**{user.get('best_jackpot',0):,}** 🪙", inline=True)
+    embed.add_field(name="🦹 Meilleur rob", value=f"**{user.get('best_rob',0):,}** 🪙", inline=True)
     await ctx.send(embed=embed)
 
 @bot.command(name="solde", aliases=["balance", "coins"])
@@ -417,6 +578,8 @@ async def solde(ctx):
         description=f"{ctx.author.mention}\n# {user['coins']:,} 🪙",
         color=COLOR_GREEN
     )
+    embed.add_field(name="🏦 Banque", value=f"**{user.get('bank',0):,}** 🪙", inline=True)
+    embed.add_field(name="💎 Total", value=f"**{user['coins'] + user.get('bank',0):,}** 🪙", inline=True)
     embed.set_footer(text="Utilise %daily, %work ou %crime pour gagner plus !")
     await ctx.send(embed=embed)
 
@@ -442,7 +605,7 @@ async def classement(ctx):
 @bot.command(name="richesse")
 async def richesse(ctx):
     data = load_data()
-    scores = [(int(uid), d["coins"]) for uid, d in data.items()]
+    scores = [(int(uid), d["coins"] + d.get("bank", 0)) for uid, d in data.items()]
     scores.sort(key=lambda x: x[1], reverse=True)
     medals = ["🥇","🥈","🥉"] + ["🏅"]*7
     lines = []
@@ -455,6 +618,116 @@ async def richesse(ctx):
         description="\n".join(lines) if lines else "Aucune donnée.",
         color=COLOR_GREEN
     )
+    await ctx.send(embed=embed)
+
+@bot.command(name="palmares")
+async def palmares(ctx):
+    """Records historiques du serveur."""
+    data = load_data()
+    best_streak = (0, "—")
+    best_jackpot = (0, "—")
+    best_rob = (0, "—")
+    best_games = (0, "—")
+
+    for uid, udata in data.items():
+        member = ctx.guild.get_member(int(uid))
+        name = member.display_name if member else f"User#{uid}"
+        if udata.get("streak_daily", 0) > best_streak[0]:
+            best_streak = (udata["streak_daily"], name)
+        if udata.get("best_jackpot", 0) > best_jackpot[0]:
+            best_jackpot = (udata["best_jackpot"], name)
+        if udata.get("best_rob", 0) > best_rob[0]:
+            best_rob = (udata["best_rob"], name)
+        if udata.get("total_games_played", 0) > best_games[0]:
+            best_games = (udata["total_games_played"], name)
+
+    embed = discord.Embed(title="🏆  Palmarès du Serveur", color=COLOR_GOLD)
+    embed.add_field(name="🔥 Plus grand streak daily", value=f"**{best_streak[1]}** — {best_streak[0]} jours", inline=False)
+    embed.add_field(name="💰 Plus gros jackpot", value=f"**{best_jackpot[1]}** — {best_jackpot[0]:,} 🪙", inline=False)
+    embed.add_field(name="🦹 Plus gros vol", value=f"**{best_rob[1]}** — {best_rob[0]:,} 🪙", inline=False)
+    embed.add_field(name="🎮 Plus de parties jouées", value=f"**{best_games[1]}** — {best_games[0]:,} parties", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command(name="historique", aliases=["history"])
+async def historique(ctx):
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    save_data(data)
+    hist = user.get("history", [])
+    if not hist:
+        return await ctx.send(embed=discord.Embed(
+            title="📋  Historique",
+            description="Aucune transaction enregistrée.",
+            color=COLOR_BLUE
+        ))
+    lines = []
+    for entry in hist:
+        ts = datetime.fromtimestamp(entry["ts"]).strftime("%d/%m %H:%M")
+        sign = "+" if entry["amount"] >= 0 else ""
+        lines.append(f"`{ts}`  {entry['label']}  **{sign}{entry['amount']:,}** 🪙")
+    embed = discord.Embed(
+        title=f"📋  Historique de {ctx.author.display_name}",
+        description="\n".join(lines),
+        color=COLOR_BLUE
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name="cooldowns", aliases=["cd"])
+async def cooldowns(ctx):
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    save_data(data)
+    now = time.time()
+    mult = get_cooldown_mult(user)
+
+    def cd_status(last: float, cooldown_base: float) -> str:
+        cd = cooldown_base * mult
+        remaining = cd - (now - last)
+        if remaining <= 0:
+            return "✅ Disponible !"
+        return f"⏳ {format_time(remaining)}"
+
+    embed = discord.Embed(title=f"⏱️  Cooldowns de {ctx.author.display_name}", color=COLOR_BLUE)
+    if user.get("vip_until", 0) > now:
+        embed.description = "💎 **VIP actif** — cooldowns réduits de 50% !"
+    embed.add_field(name="🎁 Daily", value=cd_status(user["last_daily"], 86400), inline=True)
+    embed.add_field(name="💼 Work", value=cd_status(user["last_work"], 2700), inline=True)
+    embed.add_field(name="🚔 Crime", value=cd_status(user["last_crime"], 5400), inline=True)
+    embed.add_field(name="🦹 Rob", value=cd_status(user.get("last_rob", 0), 10800), inline=True)
+    embed.add_field(name="🎁 Cadeau", value=cd_status(user.get("last_cadeau", 0), 43200), inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command(name="objectif", aliases=["objectifs", "daily_quest"])
+async def objectif(ctx):
+    """Objectifs journaliers personnels."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    save_data(data)
+    now = time.time()
+
+    # Générer des objectifs basés sur un seed quotidien
+    day_seed = int(now // 86400)
+    rng = random.Random(day_seed + ctx.author.id)
+
+    goals = [
+        {"label": "🎮 Jouer 3 parties de casino", "key": "total_games_played", "target": user.get("total_games_played", 0) + 3, "reward": 150},
+        {"label": "🏆 Gagner 2 parties de casino", "key": "casino_wins", "target": user.get("casino_wins", 0) + 2, "reward": 200},
+        {"label": "💼 Utiliser %work", "key": "last_work", "target": now - 2700, "reward": 100},
+    ]
+    chosen = rng.sample(goals, k=2)
+
+    embed = discord.Embed(
+        title="🎯  Objectifs Journaliers",
+        description="Complète ces objectifs pour gagner des bonus !",
+        color=COLOR_TEAL
+    )
+    for g in chosen:
+        embed.add_field(
+            name=g["label"],
+            value=f"Récompense : **{g['reward']} 🪙**\n*(Suivi automatique dans `%stats`)*",
+            inline=False
+        )
+    embed.set_footer(text="Les objectifs se renouvellent chaque jour à minuit.")
     await ctx.send(embed=embed)
 
 # ─── Argent ───────────────────────────────────────────────────────────────────
@@ -475,19 +748,17 @@ async def daily(ctx):
         embed.set_footer(text=f"Streak actuel : {user.get('streak_daily',0)} jours 🔥")
         return await ctx.send(embed=embed)
 
-    # Streak
     streak = user.get("streak_daily", 0)
     last_streak = user.get("last_daily_streak", 0)
-    if now - last_streak < 172800:  # moins de 48h depuis dernier daily → streak continue
+    if now - last_streak < 172800:
         streak += 1
     else:
         streak = 1
     user["streak_daily"] = streak
     user["last_daily_streak"] = now
 
-    # Montant de base réduit, mais streak donne bonus
     base = random.randint(80, 180)
-    streak_bonus = min(streak * 5, 100)  # max +100 au bout de 20 jours
+    streak_bonus = min(streak * 5, 100)
     amount = base + streak_bonus
 
     if user.get("daily_bonus_x2"):
@@ -497,12 +768,10 @@ async def daily(ctx):
     user["coins"] += amount
     user["total_earned"] = user.get("total_earned", 0) + amount
     user["last_daily"] = now
+    add_history(user, "🎁 Daily", amount)
     save_data(data)
 
-    embed = discord.Embed(
-        title="🎁  Daily récupéré !",
-        color=COLOR_GREEN
-    )
+    embed = discord.Embed(title="🎁  Daily récupéré !", color=COLOR_GREEN)
     embed.add_field(name="💰 Gains", value=f"**+{amount:,}** 🪙", inline=True)
     embed.add_field(name="🔥 Streak", value=f"**{streak}** jours", inline=True)
     embed.add_field(name="📈 Bonus streak", value=f"+**{streak_bonus}** 🪙", inline=True)
@@ -514,15 +783,14 @@ async def work(ctx):
     data = load_data()
     user = get_user(data, ctx.author.id)
     now = time.time()
-    cooldown = 2700 * get_cooldown_mult(user)  # 45min
+    cooldown = 2700 * get_cooldown_mult(user)
     if now - user["last_work"] < cooldown:
         remaining = cooldown - (now - user["last_work"])
-        embed = discord.Embed(
+        return await ctx.send(embed=discord.Embed(
             title="⏳  Tu travailles déjà !",
             description=f"Repose-toi encore **{format_time(remaining)}**.",
             color=COLOR_RED
-        )
-        return await ctx.send(embed=embed)
+        ))
     jobs = [
         ("🍕", "Livreur de pizzas", 30, 80),
         ("💻", "Développeur freelance", 50, 140),
@@ -540,6 +808,7 @@ async def work(ctx):
     user["coins"] += amount
     user["total_earned"] = user.get("total_earned", 0) + amount
     user["last_work"] = now
+    add_history(user, f"{emoji} Work: {job}", amount)
     save_data(data)
     embed = discord.Embed(
         title=f"{emoji}  Tu as travaillé !",
@@ -556,27 +825,25 @@ async def crime(ctx):
     data = load_data()
     user = get_user(data, ctx.author.id)
     now = time.time()
-    cooldown = 5400 * get_cooldown_mult(user)  # 90min
+    cooldown = 5400 * get_cooldown_mult(user)
     if now - user["last_crime"] < cooldown:
         remaining = cooldown - (now - user["last_crime"])
-        embed = discord.Embed(
+        return await ctx.send(embed=discord.Embed(
             title="⏳  Les flics te surveillent !",
             description=f"Attends **{format_time(remaining)}** avant de recommencer.",
             color=COLOR_RED
-        )
-        return await ctx.send(embed=embed)
+        ))
     user["last_crime"] = now
-    if random.random() < 0.40:  # 40% de risque
+    if random.random() < 0.40:
         fine = random.randint(80, 300)
         user["coins"] = max(0, user["coins"] - fine)
+        add_history(user, "🚔 Crime raté — amende", -fine)
         save_data(data)
-        embed = discord.Embed(
+        return await ctx.send(embed=discord.Embed(
             title="🚔  Arrêté !",
             description=f"La police t'a rattrapé. Amende de **{fine:,}** 🪙.",
             color=COLOR_RED
-        )
-        embed.set_footer(text="Prends garde la prochaine fois...")
-        return await ctx.send(embed=embed)
+        ))
     crimes = [
         ("🏦", "Braquage de banque", 150, 450),
         ("💎", "Vol de bijoux", 120, 380),
@@ -588,6 +855,7 @@ async def crime(ctx):
     amount = random.randint(mn, mx)
     user["coins"] += amount
     user["total_earned"] = user.get("total_earned", 0) + amount
+    add_history(user, f"{e} Crime: {name}", amount)
     save_data(data)
     embed = discord.Embed(
         title=f"{e}  Crime réussi !",
@@ -607,41 +875,46 @@ async def rob(ctx, target: discord.Member):
     robber = get_user(data, ctx.author.id)
     victim = get_user(data, target.id)
     now = time.time()
-    cooldown = 10800 * get_cooldown_mult(robber)  # 3h
+    cooldown = 10800 * get_cooldown_mult(robber)
     if now - robber.get("last_rob", 0) < cooldown:
         remaining = cooldown - (now - robber["last_rob"])
-        embed = discord.Embed(
+        return await ctx.send(embed=discord.Embed(
             title="⏳  Trop risqué !",
             description=f"Attends **{format_time(remaining)}** avant de voler à nouveau.",
             color=COLOR_RED
-        )
-        return await ctx.send(embed=embed)
+        ))
     if victim.get("shield"):
         victim["shield"] = False
         robber["last_rob"] = now
         save_data(data)
-        embed = discord.Embed(
+        return await ctx.send(embed=discord.Embed(
             title="🛡️  Bouclier activé !",
-            description=f"{target.display_name} était protégé. Ton tentative de vol a échoué !",
+            description=f"{target.display_name} était protégé. Ta tentative a échoué !",
             color=COLOR_BLUE
-        )
-        return await ctx.send(embed=embed)
+        ))
     if victim["coins"] < 100:
-        return await ctx.send(embed=discord.Embed(description=f"💸 {target.display_name} n'a pas assez de coins.", color=COLOR_RED))
+        return await ctx.send(embed=discord.Embed(
+            description=f"💸 {target.display_name} n'a pas assez de coins.",
+            color=COLOR_RED
+        ))
     robber["last_rob"] = now
-    if random.random() < 0.45:  # 45% de se faire attraper
+    if random.random() < 0.45:
         fine = random.randint(60, 250)
         robber["coins"] = max(0, robber["coins"] - fine)
+        add_history(robber, f"🚔 Rob raté sur {target.display_name}", -fine)
         save_data(data)
-        embed = discord.Embed(
+        return await ctx.send(embed=discord.Embed(
             title="🚔  Pris la main dans le sac !",
             description=f"{ctx.author.mention} s'est fait attraper. Amende : **{fine:,}** 🪙.",
             color=COLOR_RED
-        )
-        return await ctx.send(embed=embed)
+        ))
     stolen = random.randint(80, min(400, victim["coins"] // 3))
     victim["coins"] -= stolen
     robber["coins"] += stolen
+    if stolen > robber.get("best_rob", 0):
+        robber["best_rob"] = stolen
+    add_history(robber, f"🦹 Rob sur {target.display_name}", stolen)
+    add_history(victim, f"😱 Volé par {ctx.author.display_name}", -stolen)
     save_data(data)
     embed = discord.Embed(
         title="🦹  Vol réussi !",
@@ -665,32 +938,220 @@ async def transfer(ctx, target: discord.Member, amount: str = "0"):
         return await ctx.send(embed=discord.Embed(description="❌ Montant doit être positif.", color=COLOR_RED))
     if amt > sender["coins"]:
         return await ctx.send(embed=discord.Embed(description=f"❌ Tu n'as que **{sender['coins']:,}** 🪙.", color=COLOR_RED))
-    # Taxe de transfert : 5%
     tax = max(1, int(amt * 0.05))
     net = amt - tax
     sender["coins"] -= amt
     receiver["coins"] += net
+    add_history(sender, f"📤 Transfert → {target.display_name}", -amt)
+    add_history(receiver, f"📥 Reçu de {ctx.author.display_name}", net)
     save_data(data)
-    embed = discord.Embed(
-        title="💸  Transfert effectué",
-        color=COLOR_GREEN
-    )
+    embed = discord.Embed(title="💸  Transfert effectué", color=COLOR_GREEN)
     embed.add_field(name="📤 Envoyé", value=f"**{amt:,}** 🪙", inline=True)
     embed.add_field(name="📥 Reçu", value=f"**{net:,}** 🪙", inline=True)
     embed.add_field(name="🏦 Taxe (5%)", value=f"**{tax:,}** 🪙", inline=True)
     embed.set_footer(text=f"{ctx.author.display_name} → {target.display_name}")
     await ctx.send(embed=embed)
 
-# ─── Casino helpers ────────────────────────────────────────────────────────────
-
-def parse_bet(user: dict, arg: str) -> int | None:
-    if arg.lower() in ("all", "tout"):
-        return user["coins"]
+@bot.command(name="cadeau")
+async def cadeau(ctx, target: discord.Member, amount: str = "0"):
+    """Offrir des coins sans taxe — cooldown 12h, max 500 🪙."""
+    if target.bot or target.id == ctx.author.id:
+        return await ctx.send(embed=discord.Embed(description="❌ Cible invalide.", color=COLOR_RED))
+    data = load_data()
+    sender = get_user(data, ctx.author.id)
+    receiver = get_user(data, target.id)
+    now = time.time()
+    cooldown = 43200 * get_cooldown_mult(sender)
+    if now - sender.get("last_cadeau", 0) < cooldown:
+        remaining = cooldown - (now - sender["last_cadeau"])
+        return await ctx.send(embed=discord.Embed(
+            title="⏳  Cadeau déjà envoyé !",
+            description=f"Attends **{format_time(remaining)}**.",
+            color=COLOR_RED
+        ))
     try:
-        v = int(arg)
-        return v if v > 0 else None
+        amt = min(int(amount), 500)
     except:
-        return None
+        return await ctx.send(embed=discord.Embed(description="❌ Montant invalide.", color=COLOR_RED))
+    if amt <= 0:
+        return await ctx.send(embed=discord.Embed(description="❌ Montant doit être positif.", color=COLOR_RED))
+    if amt > sender["coins"]:
+        return await ctx.send(embed=discord.Embed(description=f"❌ Tu n'as que **{sender['coins']:,}** 🪙.", color=COLOR_RED))
+    sender["coins"] -= amt
+    receiver["coins"] += amt
+    sender["last_cadeau"] = now
+    add_history(sender, f"🎁 Cadeau → {target.display_name}", -amt)
+    add_history(receiver, f"🎁 Cadeau de {ctx.author.display_name}", amt)
+    save_data(data)
+    embed = discord.Embed(
+        title="🎁  Cadeau envoyé !",
+        description=f"{ctx.author.mention} offre **{amt:,}** 🪙 à {target.mention} sans taxe !",
+        color=COLOR_GREEN
+    )
+    embed.set_footer(text="Cooldown : 12h • Maximum : 500 🪙")
+    await ctx.send(embed=embed)
+
+# ─── Banque ───────────────────────────────────────────────────────────────────
+
+@bot.command(name="banque", aliases=["bank"])
+async def banque(ctx, action: str = "solde", amount: str = "0"):
+    """Banque sécurisée — les coins en banque ne peuvent pas être volés."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    action = action.lower()
+
+    if action in ("solde", "s", "balance"):
+        embed = discord.Embed(title="🏦  Banque", color=COLOR_BLUE)
+        embed.add_field(name="💰 Portefeuille", value=f"**{user['coins']:,}** 🪙", inline=True)
+        embed.add_field(name="🏦 Banque", value=f"**{user.get('bank', 0):,}** 🪙", inline=True)
+        embed.add_field(name="💎 Total", value=f"**{user['coins'] + user.get('bank', 0):,}** 🪙", inline=True)
+        embed.set_footer(text="Les coins en banque sont protégés des vols !")
+        save_data(data)
+        return await ctx.send(embed=embed)
+
+    try:
+        amt = int(amount) if amount.lower() not in ("all","tout") else (user["coins"] if action in ("dep","deposer","deposit") else user.get("bank", 0))
+    except:
+        return await ctx.send(embed=discord.Embed(description="❌ Montant invalide.", color=COLOR_RED))
+
+    if amt <= 0:
+        return await ctx.send(embed=discord.Embed(description="❌ Montant doit être positif.", color=COLOR_RED))
+
+    if action in ("dep", "deposer", "deposit", "d"):
+        if amt > user["coins"]:
+            return await ctx.send(embed=discord.Embed(description=f"❌ Tu n'as que **{user['coins']:,}** 🪙.", color=COLOR_RED))
+        user["coins"] -= amt
+        user["bank"] = user.get("bank", 0) + amt
+        add_history(user, "🏦 Dépôt banque", -amt)
+        save_data(data)
+        embed = discord.Embed(title="🏦  Dépôt effectué", color=COLOR_GREEN)
+        embed.add_field(name="📥 Déposé", value=f"**{amt:,}** 🪙", inline=True)
+        embed.add_field(name="🏦 Solde banque", value=f"**{user['bank']:,}** 🪙", inline=True)
+        return await ctx.send(embed=embed)
+
+    elif action in ("ret", "retirer", "withdraw", "r"):
+        bank_bal = user.get("bank", 0)
+        if amt > bank_bal:
+            return await ctx.send(embed=discord.Embed(description=f"❌ Tu n'as que **{bank_bal:,}** 🪙 en banque.", color=COLOR_RED))
+        user["bank"] = bank_bal - amt
+        user["coins"] += amt
+        add_history(user, "🏦 Retrait banque", amt)
+        save_data(data)
+        embed = discord.Embed(title="🏦  Retrait effectué", color=COLOR_GREEN)
+        embed.add_field(name="📤 Retiré", value=f"**{amt:,}** 🪙", inline=True)
+        embed.add_field(name="💰 Portefeuille", value=f"**{user['coins']:,}** 🪙", inline=True)
+        return await ctx.send(embed=embed)
+
+    else:
+        return await ctx.send(embed=discord.Embed(
+            description="❌ Usage : `%banque <dep|ret|solde> [montant]`",
+            color=COLOR_RED
+        ))
+
+@bot.command(name="pret", aliases=["loan", "emprunter"])
+async def pret(ctx, amount: str = "0"):
+    """Emprunter des coins avec 20% d'intérêts — à rembourser en 24h."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    now = time.time()
+
+    if user.get("loan_amount", 0) > 0:
+        due_str = format_time(max(0, user["loan_due"] - now))
+        return await ctx.send(embed=discord.Embed(
+            title="❌  Prêt en cours",
+            description=f"Tu as déjà un prêt de **{user['loan_amount']:,}** 🪙 en cours.\nRembourse avec `%rembourser` — il reste **{due_str}**.",
+            color=COLOR_RED
+        ))
+
+    try:
+        amt = int(amount)
+    except:
+        return await ctx.send(embed=discord.Embed(description="❌ Montant invalide.", color=COLOR_RED))
+
+    max_loan = 1000
+    if amt <= 0 or amt > max_loan:
+        return await ctx.send(embed=discord.Embed(
+            description=f"❌ Tu peux emprunter entre **1** et **{max_loan:,}** 🪙.",
+            color=COLOR_RED
+        ))
+
+    interest = int(amt * 0.20)
+    total_due = amt + interest
+    user["coins"] += amt
+    user["loan_amount"] = total_due
+    user["loan_due"] = now + 86400
+    add_history(user, f"🏦 Prêt reçu", amt)
+    save_data(data)
+
+    embed = discord.Embed(title="🏦  Prêt accordé !", color=COLOR_ORANGE)
+    embed.add_field(name="💰 Reçu", value=f"**{amt:,}** 🪙", inline=True)
+    embed.add_field(name="📈 Intérêts (20%)", value=f"**{interest:,}** 🪙", inline=True)
+    embed.add_field(name="💸 À rembourser", value=f"**{total_due:,}** 🪙", inline=True)
+    embed.set_footer(text="⚠️ Remboursement obligatoire sous 24h — pénalité x1.5 si défaut !")
+    await ctx.send(embed=embed)
+
+@bot.command(name="rembourser", aliases=["repay", "remboursement"])
+async def rembourser(ctx):
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    now = time.time()
+
+    if user.get("loan_amount", 0) <= 0:
+        return await ctx.send(embed=discord.Embed(description="✅ Tu n'as aucun prêt en cours.", color=COLOR_GREEN))
+
+    due = user["loan_amount"]
+    if user["coins"] < due:
+        return await ctx.send(embed=discord.Embed(
+            description=f"❌ Il te faut **{due:,}** 🪙 pour rembourser. Tu n'en as que **{user['coins']:,}**.",
+            color=COLOR_RED
+        ))
+
+    user["coins"] -= due
+    user["loan_amount"] = 0
+    user["loan_due"] = 0
+    add_history(user, "🏦 Prêt remboursé", -due)
+    save_data(data)
+
+    embed = discord.Embed(title="✅  Prêt remboursé !", color=COLOR_GREEN)
+    embed.add_field(name="💸 Payé", value=f"**{due:,}** 🪙", inline=True)
+    embed.add_field(name="💰 Solde restant", value=f"**{user['coins']:,}** 🪙", inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command(name="investir", aliases=["invest"])
+async def investir(ctx, amount: str = "0"):
+    """Investir des coins — résultat après 6h (−30% à +80%)."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    now = time.time()
+
+    if user.get("invest_amount", 0) > 0:
+        remaining = max(0, user["invest_due"] - now)
+        return await ctx.send(embed=discord.Embed(
+            title="📈  Investissement en cours",
+            description=f"Tu as déjà **{user['invest_amount']:,}** 🪙 investis.\nRésultat dans **{format_time(remaining)}**.",
+            color=COLOR_ORANGE
+        ))
+
+    bet = parse_bet(user, amount)
+    if not bet or bet < 50:
+        return await ctx.send(embed=discord.Embed(description="❌ Minimum d'investissement : **50** 🪙.", color=COLOR_RED))
+    if bet > user["coins"]:
+        return await ctx.send(embed=discord.Embed(description="❌ Pas assez de coins.", color=COLOR_RED))
+
+    user["coins"] -= bet
+    user["invest_amount"] = bet
+    user["invest_due"] = now + 21600  # 6h
+    add_history(user, "📈 Investissement placé", -bet)
+    save_data(data)
+
+    embed = discord.Embed(title="📈  Investissement lancé !", color=COLOR_TEAL)
+    embed.add_field(name="💰 Investi", value=f"**{bet:,}** 🪙", inline=True)
+    embed.add_field(name="⏱️ Retour", value="Dans **6 heures**", inline=True)
+    embed.add_field(name="📊 Rendement possible", value="Entre **−30%** et **+80%**", inline=True)
+    embed.set_footer(text="Le résultat sera automatiquement crédité dans 6h !")
+    await ctx.send(embed=embed)
+
+# ─── Casino helpers ────────────────────────────────────────────────────────────
 
 # ─── Casino ───────────────────────────────────────────────────────────────────
 
@@ -713,12 +1174,16 @@ async def slot(ctx, mise: str = "0"):
         mult_map = {"7️⃣": 20, "💎": 10, "⭐": 7, "🔔": 5}
         mult = mult_map.get(reels[0], 3)
         win = bet * mult
-        user["coins"] += win - bet
+        gain = win - bet
+        user["coins"] += gain
         user["casino_wins"] += 1
-        user["total_earned"] = user.get("total_earned", 0) + (win - bet)
+        user["total_earned"] = user.get("total_earned", 0) + gain
+        if gain > user.get("best_jackpot", 0):
+            user["best_jackpot"] = gain
+        add_history(user, f"🎰 Slot JACKPOT x{mult}", gain)
         embed = discord.Embed(title="🎰  JACKPOT !", description=f"╔══════════════╗\n║  {result_str}  ║\n╚══════════════╝", color=COLOR_GOLD)
         embed.add_field(name="🎉 Multiplicateur", value=f"x**{mult}**", inline=True)
-        embed.add_field(name="💰 Gains", value=f"+**{win - bet:,}** 🪙", inline=True)
+        embed.add_field(name="💰 Gains", value=f"+**{gain:,}** 🪙", inline=True)
         embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
     elif reels[0] == reels[1] or reels[1] == reels[2]:
         embed = discord.Embed(title="🎰  Deux identiques !", description=f"╔══════════════╗\n║  {result_str}  ║\n╚══════════════╝", color=COLOR_BLUE)
@@ -727,6 +1192,7 @@ async def slot(ctx, mise: str = "0"):
     else:
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
+        add_history(user, "🎰 Slot perdu", -bet)
         embed = discord.Embed(title="🎰  Perdu !", description=f"╔══════════════╗\n║  {result_str}  ║\n╚══════════════╝", color=COLOR_RED)
         embed.add_field(name="❌ Perte", value=f"-**{bet:,}** 🪙", inline=True)
         embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
@@ -751,11 +1217,13 @@ async def coinflip(ctx, mise: str = "0", choix: str = "pile"):
         user["coins"] += bet
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + bet
+        add_history(user, "🪙 Coinflip gagné", bet)
         embed = discord.Embed(title="🪙  Pile ou Face", description=f"La pièce tombe sur **{result.upper()}** !", color=COLOR_GREEN)
         embed.add_field(name="✅ Gagné !", value=f"+**{bet:,}** 🪙", inline=True)
     else:
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
+        add_history(user, "🪙 Coinflip perdu", -bet)
         embed = discord.Embed(title="🪙  Pile ou Face", description=f"La pièce tombe sur **{result.upper()}** !", color=COLOR_RED)
         embed.add_field(name="❌ Perdu !", value=f"-**{bet:,}** 🪙", inline=True)
     embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
@@ -796,19 +1264,28 @@ async def blackjack(ctx, mise: str = "0"):
 
     def make_embed(hide_dealer=True):
         pv = hand_value(player)
-        p_cards = " ".join(player)
-        if hide_dealer:
-            d_display = f"{dealer[0]}  🂠"
-            d_val_str = "?"
-        else:
-            d_display = " ".join(dealer)
-            d_val_str = str(hand_value(dealer))
         embed = discord.Embed(title="🃏  Blackjack", color=COLOR_DARK)
-        embed.add_field(name=f"Toi  ({pv})", value=f"`{p_cards}`", inline=True)
-        embed.add_field(name=f"Croupier  ({d_val_str})", value=f"`{d_display}`", inline=True)
-        embed.add_field(name="💰 Mise", value=f"**{bet:,}** 🪙", inline=False)
+        embed.add_field(
+            name=f"🧑 Toi  ({pv})",
+            value=render_hand(player),
+            inline=False
+        )
         if hide_dealer:
-            embed.set_footer(text="hit • stand  (ou h • s)")
+            embed.add_field(
+                name="🤵 Croupier  (?)",
+                value=render_hand([dealer[0], "?♠"], hide_last=True),
+                inline=False
+            )
+        else:
+            dv = hand_value(dealer)
+            embed.add_field(
+                name=f"🤵 Croupier  ({dv})",
+                value=render_hand(dealer),
+                inline=False
+            )
+        embed.add_field(name="💰 Mise", value=f"**{bet:,}** 🪙", inline=True)
+        if hide_dealer:
+            embed.set_footer(text="Tape  hit (h)  pour tirer  •  stand (s)  pour rester")
         return embed
 
     await ctx.send(embed=make_embed())
@@ -828,6 +1305,7 @@ async def blackjack(ctx, mise: str = "0"):
         if hand_value(player) > 21:
             user["coins"] = max(0, user["coins"] - bet)
             user["casino_losses"] += 1
+            add_history(user, "🃏 Blackjack bust", -bet)
             save_data(data)
             e = make_embed(False)
             e.color = COLOR_RED
@@ -845,6 +1323,7 @@ async def blackjack(ctx, mise: str = "0"):
         user["coins"] += bet
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + bet
+        add_history(user, "🃏 Blackjack gagné", bet)
         e.color = COLOR_GREEN
         e.add_field(name="🎉 Victoire !", value=f"+**{bet:,}** 🪙", inline=True)
     elif pv == dv:
@@ -853,6 +1332,7 @@ async def blackjack(ctx, mise: str = "0"):
     else:
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
+        add_history(user, "🃏 Blackjack perdu", -bet)
         e.color = COLOR_RED
         e.add_field(name="❌ Défaite", value=f"-**{bet:,}** 🪙", inline=True)
     e.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
@@ -901,10 +1381,12 @@ async def roulette(ctx, mise: str = "0", choix: str = "rouge"):
         user["coins"] += gain
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
+        add_history(user, f"🎡 Roulette gagné x{mult}", gain)
         embed.add_field(name="🎉 Gagné !", value=f"+**{gain:,}** 🪙  (x{mult})", inline=False)
     else:
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
+        add_history(user, "🎡 Roulette perdu", -bet)
         embed.add_field(name="❌ Perdu !", value=f"-**{bet:,}** 🪙", inline=False)
     embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
     save_data(data)
@@ -929,6 +1411,7 @@ async def dice(ctx, mise: str = "0"):
         user["coins"] += bet
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + bet
+        add_history(user, "🎲 Dice gagné", bet)
         embed.color = COLOR_GREEN
         embed.add_field(name="🎉 Gagné !", value=f"+**{bet:,}** 🪙", inline=True)
     elif total == 7:
@@ -937,11 +1420,14 @@ async def dice(ctx, mise: str = "0"):
     else:
         user["coins"] = max(0, user["coins"] - bet)
         user["casino_losses"] += 1
+        add_history(user, "🎲 Dice perdu", -bet)
         embed.color = COLOR_RED
         embed.add_field(name="❌ Perdu !", value=f"-**{bet:,}** 🪙", inline=True)
     embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
     save_data(data)
     await ctx.send(embed=embed)
+
+# ─── CRASH (corrigé) ──────────────────────────────────────────────────────────
 
 @bot.command(name="crash")
 async def crash(ctx, mise: str = "0"):
@@ -956,7 +1442,6 @@ async def crash(ctx, mise: str = "0"):
 
     user["total_games_played"] = user.get("total_games_played", 0) + 1
 
-    # Génère le multiplicateur de crash (distribution réaliste)
     r = random.random()
     if r < 0.40:
         crash_at = round(random.uniform(1.0, 1.5), 2)
@@ -975,14 +1460,17 @@ async def crash(ctx, mise: str = "0"):
             e = discord.Embed(title="💥  CRASH !", color=COLOR_RED)
         else:
             e = discord.Embed(title="📈  Crash — En cours...", color=COLOR_CASINO)
+        # Barre de progression visuelle
+        safe_pct = min(int((mult - 1) / (crash_at - 1) * 16), 16) if crash_at > 1 else 16
+        bar = "🟩" * safe_pct + "🟥" * (16 - safe_pct) if not crashed else "🟥" * 16
         e.add_field(name="📊 Multiplicateur", value=f"**x{mult:.2f}** {'💥' if crashed else '🚀'}", inline=True)
         e.add_field(name="💰 Valeur actuelle", value=f"**{val:,}** 🪙", inline=True)
         e.add_field(name="💵 Mise", value=f"**{bet:,}** 🪙", inline=True)
+        e.add_field(name="📉 Risque", value=bar, inline=False)
         if not crashed:
-            e.set_footer(text="Tape 'stop' pour encaisser !")
+            e.set_footer(text="Tape  stop  pour encaisser !")
         return e
 
-    # Envoie UN seul embed dès le départ
     msg = await ctx.send(embed=make_crash_embed(1.0))
 
     current_mult = 1.0
@@ -990,11 +1478,25 @@ async def crash(ctx, mise: str = "0"):
     cashed_out = False
     stop_mult = None
 
-    # Boucle principale : on avance le mult, on édite l'embed, on vérifie les messages
+    # ── BOUCLE CORRIGÉE ──
+    # On avance d'abord le mult, puis on écoute le stop pendant le tick.
     while True:
-        # Attente entre chaque tick — pendant ce temps on écoute les messages
+        # 1. Avancer le multiplicateur
+        current_mult = round(current_mult + step, 2)
+        step = round(step * 1.06, 3)
+
+        # 2. Vérifier le crash AVANT d'afficher
+        if current_mult >= crash_at:
+            current_mult = crash_at
+            await msg.edit(embed=make_crash_embed(current_mult, crashed=True))
+            break
+
+        # 3. Mettre à jour l'embed avec la vraie valeur
+        await msg.edit(embed=make_crash_embed(current_mult))
+
+        # 4. Écouter le stop pendant 1.5 secondes
         try:
-            resp = await asyncio.wait_for(
+            await asyncio.wait_for(
                 bot.wait_for(
                     "message",
                     check=lambda m: (
@@ -1005,47 +1507,33 @@ async def crash(ctx, mise: str = "0"):
                 ),
                 timeout=1.5
             )
-            # Le joueur a tapé stop
             cashed_out = True
-            stop_mult = current_mult
+            stop_mult = current_mult  # ✅ mult déjà à jour, valeur correcte
             break
         except asyncio.TimeoutError:
-            pass  # Pas de stop, on continue
-
-        # Avance le multiplicateur
-        current_mult = round(current_mult + step, 2)
-        step = round(step * 1.06, 3)  # accélération progressive
-
-        if current_mult >= crash_at:
-            current_mult = crash_at
-            # Crash ! On édite l'embed avec l'état final crashé
-            await msg.edit(embed=make_crash_embed(current_mult, crashed=True))
-            break
-
-        # Mise à jour de l'embed (edit, pas nouveau message)
-        await msg.edit(embed=make_crash_embed(current_mult))
+            pass
 
     # Résultat
     if cashed_out:
-        mult_used = stop_mult
-        win = int(bet * mult_used)
+        win = int(bet * stop_mult)
         gain = win - bet
         user["coins"] += gain
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
+        add_history(user, f"📈 Crash cashout x{stop_mult:.2f}", gain)
         result_embed = discord.Embed(
             title="💸  Cashout !",
-            description=f"Tu as encaissé à **x{mult_used:.2f}** !\n*Le crash était à x{crash_at:.2f}*",
+            description=f"Tu as encaissé à **x{stop_mult:.2f}** !\n*Le crash était à x{crash_at:.2f}*",
             color=COLOR_GREEN
         )
         result_embed.add_field(name="💰 Gains", value=f"+**{gain:,}** 🪙", inline=True)
         result_embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
     else:
-        # Crash sans cashout
         if user.get("insurance"):
             refund = bet // 2
             user["coins"] = max(0, user["coins"] - bet + refund)
             user["insurance"] = False
+            add_history(user, f"💥 Crash x{crash_at:.2f} (assurance)", -(bet - refund))
             result_embed = discord.Embed(
                 title="💥  Crash !",
                 description=f"Crash à **x{crash_at:.2f}** !\n🔒 Assurance activée — remboursement partiel.",
@@ -1055,6 +1543,7 @@ async def crash(ctx, mise: str = "0"):
             result_embed.add_field(name="🔒 Remboursé", value=f"+**{refund:,}** 🪙", inline=True)
         else:
             user["coins"] = max(0, user["coins"] - bet)
+            add_history(user, f"💥 Crash x{crash_at:.2f}", -bet)
             result_embed = discord.Embed(
                 title="💥  CRASH !",
                 description=f"Le marché s'est effondré à **x{crash_at:.2f}** ! 📉",
@@ -1065,8 +1554,372 @@ async def crash(ctx, mise: str = "0"):
         result_embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
 
     save_data(data)
-    # On édite le message existant avec le résultat final (toujours 1 seul message)
     await msg.edit(embed=result_embed)
+
+# ─── PLINKO (nouveau) ─────────────────────────────────────────────────────────
+
+@bot.command(name="plinko")
+async def plinko(ctx, mise: str = "0"):
+    """La bille tombe dans des cases avec des multiplicateurs aléatoires."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    bet = parse_bet(user, mise)
+    if not bet or bet < 10:
+        return await ctx.send(embed=discord.Embed(description="❌ Mise minimum : **10** 🪙. Usage : `%plinko <mise>`", color=COLOR_RED))
+    if bet > user["coins"]:
+        return await ctx.send(embed=discord.Embed(description="❌ Pas assez de coins.", color=COLOR_RED))
+
+    user["total_games_played"] = user.get("total_games_played", 0) + 1
+
+    # Multiplicateurs par slot (9 slots, distribution en cloche)
+    multipliers = [0.2, 0.5, 1.0, 1.5, 3.0, 1.5, 1.0, 0.5, 0.2]
+    weights     = [3,   7,   12,  18,  20,  18,  12,  7,   3  ]
+
+    # Simuler la chute : 8 niveaux, gauche ou droite
+    pos = 4  # position centrale (0-8)
+    path = []
+    for _ in range(8):
+        move = random.choice([-1, 1])
+        pos = max(0, min(8, pos + move))
+        path.append("↙" if move == -1 else "↘")
+
+    slot = random.choices(range(9), weights=weights, k=1)[0]
+    mult = multipliers[slot]
+
+    # Affichage du plateau
+    board_top    = "┌───┬───┬───┬───┬───┬───┬───┬───┬───┐"
+    board_mults  = "│" + "│".join(f"{m:.1f}".center(3) for m in multipliers) + "│"
+    board_bottom = "└───┴───┴───┴───┴───┴───┴───┴───┴───┘"
+    ball_row     = " ".join("🔴" if i == slot else " · " for i in range(9))
+    path_str     = "  ".join(path)
+
+    board_display = f"```\n{board_top}\n{board_mults}\n{board_bottom}\n{ball_row}\n```"
+
+    gain = int(bet * mult) - bet
+    if gain > 0:
+        user["coins"] += gain
+        user["casino_wins"] += 1
+        user["total_earned"] = user.get("total_earned", 0) + gain
+        add_history(user, f"🎯 Plinko x{mult}", gain)
+        color = COLOR_GREEN if mult >= 1.0 else COLOR_ORANGE
+    elif gain == 0:
+        color = COLOR_BLUE
+    else:
+        user["coins"] = max(0, user["coins"] + gain)
+        user["casino_losses"] += 1
+        add_history(user, f"🎯 Plinko x{mult}", gain)
+        color = COLOR_RED
+
+    embed = discord.Embed(title="🎯  Plinko", color=color)
+    embed.add_field(name="🎪 Plateau", value=board_display, inline=False)
+    embed.add_field(name="🔴 Chemin", value=f"`{path_str}`", inline=False)
+    embed.add_field(name="📊 Multiplicateur", value=f"**x{mult}**", inline=True)
+    sign = "+" if gain >= 0 else ""
+    embed.add_field(name="💰 Résultat", value=f"**{sign}{gain:,}** 🪙", inline=True)
+    embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
+    save_data(data)
+    await ctx.send(embed=embed)
+
+# ─── HIGHLOW (nouveau) ────────────────────────────────────────────────────────
+
+@bot.command(name="highlow", aliases=["hl"])
+async def highlow(ctx, mise: str = "0"):
+    """Devine si la prochaine carte est plus haute ou plus basse."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    bet = parse_bet(user, mise)
+    if not bet or bet < 10:
+        return await ctx.send(embed=discord.Embed(description="❌ Mise minimum : **10** 🪙. Usage : `%highlow <mise>`", color=COLOR_RED))
+    if bet > user["coins"]:
+        return await ctx.send(embed=discord.Embed(description="❌ Pas assez de coins.", color=COLOR_RED))
+
+    user["total_games_played"] = user.get("total_games_played", 0) + 1
+
+    ranks = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
+    suits_list = ["♠","♥","♦","♣"]
+    rank_vals = {r: i for i, r in enumerate(ranks)}
+
+    current_card = random.choice(ranks) + random.choice(suits_list)
+    current_rank = current_card[:-1]
+    current_val = rank_vals[current_rank]
+    mult = 1.0
+    round_num = 0
+
+    def make_hl_embed(current: str, mult: float, round_n: int):
+        e = discord.Embed(title="🃏  High or Low", color=COLOR_CASINO)
+        e.add_field(name="🃏 Carte actuelle", value=render_hand([current]), inline=False)
+        e.add_field(name="🎯 Multiplicateur actuel", value=f"**x{mult:.2f}**", inline=True)
+        e.add_field(name="💰 Valeur si cashout", value=f"**{int(bet * mult):,}** 🪙", inline=True)
+        e.add_field(name="🔄 Round", value=f"**{round_n}**", inline=True)
+        e.set_footer(text="Tape  haut  /  bas  pour jouer  •  stop  pour encaisser")
+        return e
+
+    msg = await ctx.send(embed=make_hl_embed(current_card, mult, round_num))
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and \
+               m.content.strip().lower() in ("haut","bas","h","b","high","low","stop","s")
+
+    while True:
+        try:
+            resp = await bot.wait_for("message", check=check, timeout=30)
+        except asyncio.TimeoutError:
+            break
+
+        inp = resp.content.strip().lower()
+        if inp in ("stop","s"):
+            break
+
+        next_card = random.choice(ranks) + random.choice(suits_list)
+        next_rank = next_card[:-1]
+        next_val = rank_vals[next_rank]
+
+        if inp in ("haut","h","high"):
+            win = next_val > current_val
+        else:
+            win = next_val < current_val
+
+        if next_val == current_val:
+            await ctx.send(embed=discord.Embed(
+                description=f"🃏 Égalité ! (**{next_card}**) — Aucun changement.",
+                color=COLOR_BLUE
+            ))
+            current_card, current_rank, current_val = next_card, next_rank, next_val
+            continue
+
+        if win:
+            mult = round(mult * 1.5, 2)
+            round_num += 1
+            current_card, current_rank, current_val = next_card, next_rank, next_val
+            await ctx.send(embed=discord.Embed(
+                description=f"✅ **{next_card}** — Bonne réponse ! Mult → **x{mult:.2f}**\n*(Tape `stop` pour encaisser ou continue !)*",
+                color=COLOR_GREEN
+            ))
+            msg = await ctx.send(embed=make_hl_embed(current_card, mult, round_num))
+        else:
+            # Perdu
+            user["coins"] = max(0, user["coins"] - bet)
+            user["casino_losses"] += 1
+            add_history(user, "🃏 HighLow perdu", -bet)
+            save_data(data)
+            return await ctx.send(embed=discord.Embed(
+                title="❌  Perdu !",
+                description=f"La carte était **{next_card}**.\nPerte de **{bet:,}** 🪙.",
+                color=COLOR_RED
+            ).add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True))
+
+    # Cashout
+    gain = int(bet * mult) - bet
+    user["coins"] += gain
+    user["casino_wins"] += 1
+    user["total_earned"] = user.get("total_earned", 0) + gain
+    add_history(user, f"🃏 HighLow x{mult:.2f}", gain)
+    save_data(data)
+    embed = discord.Embed(title="💸  Cashout HighLow !", color=COLOR_GREEN)
+    embed.add_field(name="📊 Mult final", value=f"**x{mult:.2f}**", inline=True)
+    embed.add_field(name="💰 Gains", value=f"+**{gain:,}** 🪙", inline=True)
+    embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
+    await ctx.send(embed=embed)
+
+# ─── VIDEO POKER (nouveau) ────────────────────────────────────────────────────
+
+def poker_hand_name(hand: list[str]) -> tuple[str, int]:
+    """Identifie la main de poker et retourne (nom, multiplicateur)."""
+    rank_order = {"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13,"A":14}
+    ranks = [c[:-1] for c in hand]
+    suits = [c[-1] for c in hand]
+    vals = sorted([rank_order[r] for r in ranks])
+    counts = {}
+    for r in ranks:
+        counts[r] = counts.get(r, 0) + 1
+    freq = sorted(counts.values(), reverse=True)
+    flush = len(set(suits)) == 1
+    straight = vals == list(range(vals[0], vals[0]+5))
+    # Royal flush
+    if flush and vals == [10,11,12,13,14]:
+        return "🌟 Royal Flush", 50
+    if flush and straight:
+        return "🎴 Quinte Flush", 25
+    if freq[0] == 4:
+        return "4️⃣ Carré", 10
+    if freq[0] == 3 and freq[1] == 2:
+        return "🏠 Full House", 6
+    if flush:
+        return "♠ Flush", 5
+    if straight:
+        return "➡️ Suite", 4
+    if freq[0] == 3:
+        return "3️⃣ Brelan", 3
+    if freq[0] == 2 and freq[1] == 2:
+        return "2️⃣ Double Paire", 2
+    if freq[0] == 2:
+        # Paire valide si J, Q, K ou A
+        pair_rank = [r for r, c in counts.items() if c == 2][0]
+        if rank_order[pair_rank] >= 11:
+            return "👥 Paire (J+)", 1
+    return "❌ Rien", 0
+
+@bot.command(name="poker")
+async def poker(ctx, mise: str = "0"):
+    """Video Poker — 5 cartes, garde celles que tu veux, une relance."""
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    bet = parse_bet(user, mise)
+    if not bet or bet < 10:
+        return await ctx.send(embed=discord.Embed(description="❌ Mise minimum : **10** 🪙. Usage : `%poker <mise>`", color=COLOR_RED))
+    if bet > user["coins"]:
+        return await ctx.send(embed=discord.Embed(description="❌ Pas assez de coins.", color=COLOR_RED))
+
+    user["total_games_played"] = user.get("total_games_played", 0) + 1
+
+    suits_list = ["♠","♥","♦","♣"]
+    ranks_list = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
+    deck = [r+s for r in ranks_list for s in suits_list]
+    random.shuffle(deck)
+
+    hand = [deck.pop() for _ in range(5)]
+
+    # Paiement
+    pay_table = (
+        "```\n"
+        "🌟 Royal Flush    → x50\n"
+        "🎴 Quinte Flush   → x25\n"
+        "4️⃣ Carré          → x10\n"
+        "🏠 Full House     → x6\n"
+        "♠  Flush          → x5\n"
+        "➡️  Suite          → x4\n"
+        "3️⃣ Brelan         → x3\n"
+        "2️⃣ Double Paire   → x2\n"
+        "👥 Paire (J+)     → x1\n"
+        "❌ Rien           → perte\n"
+        "```"
+    )
+
+    embed = discord.Embed(title="🃏  Video Poker", color=COLOR_CASINO)
+    embed.add_field(name="🂠 Ta main", value=render_hand(hand), inline=False)
+    embed.add_field(name="💰 Mise", value=f"**{bet:,}** 🪙", inline=True)
+    embed.add_field(name="📋 Gains", value=pay_table, inline=False)
+    embed.set_footer(text="Tape les numéros des cartes à GARDER (ex: 1 3 5) ou 'none' pour tout relancer")
+    await ctx.send(embed=embed)
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    try:
+        resp = await bot.wait_for("message", check=check, timeout=45)
+    except asyncio.TimeoutError:
+        return await ctx.send(embed=discord.Embed(description="⏳ Temps écoulé !", color=COLOR_RED))
+
+    content = resp.content.strip().lower()
+    if content == "none":
+        keep_indices = []
+    else:
+        try:
+            keep_indices = [int(x)-1 for x in content.split() if x.isdigit() and 1 <= int(x) <= 5]
+        except:
+            keep_indices = []
+
+    # Relance
+    new_hand = []
+    for i in range(5):
+        if i in keep_indices:
+            new_hand.append(hand[i])
+        else:
+            new_hand.append(deck.pop())
+
+    hand_name, mult = poker_hand_name(new_hand)
+
+    if mult > 0:
+        gain = bet * mult
+        user["coins"] += gain
+        user["casino_wins"] += 1
+        user["total_earned"] = user.get("total_earned", 0) + gain
+        if gain > user.get("best_jackpot", 0):
+            user["best_jackpot"] = gain
+        add_history(user, f"🃏 Poker {hand_name}", gain)
+        color = COLOR_GREEN
+        result_txt = f"+**{gain:,}** 🪙  (x{mult})"
+    else:
+        user["coins"] = max(0, user["coins"] - bet)
+        user["casino_losses"] += 1
+        add_history(user, "🃏 Poker rien", -bet)
+        color = COLOR_RED
+        result_txt = f"-**{bet:,}** 🪙"
+
+    save_data(data)
+    result = discord.Embed(title=f"🃏  Video Poker — {hand_name}", color=color)
+    result.add_field(name="🂠 Main finale", value=render_hand(new_hand), inline=False)
+    result.add_field(name="🏆 Résultat", value=result_txt, inline=True)
+    result.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
+    await ctx.send(embed=result)
+
+# ─── DUEL POKER (nouveau) ─────────────────────────────────────────────────────
+
+@bot.command(name="duel_poker", aliases=["duelpokser", "pokervspoker"])
+async def duel_poker(ctx, target: discord.Member, mise: str = "0"):
+    """Duel de poker — meilleure main gagne."""
+    if target.bot or target.id == ctx.author.id:
+        return await ctx.send(embed=discord.Embed(description="❌ Cible invalide.", color=COLOR_RED))
+    data = load_data()
+    challenger = get_user(data, ctx.author.id)
+    opponent = get_user(data, target.id)
+    bet = parse_bet(challenger, mise)
+    if not bet or bet < 10:
+        return await ctx.send(embed=discord.Embed(description="❌ Mise minimum : 10. Usage : `%duel_poker @user <mise>`", color=COLOR_RED))
+    if bet > challenger["coins"]:
+        return await ctx.send(embed=discord.Embed(description="❌ Tu n'as pas assez de coins.", color=COLOR_RED))
+    if bet > opponent["coins"]:
+        return await ctx.send(embed=discord.Embed(description=f"❌ {target.display_name} n'a pas assez de coins.", color=COLOR_RED))
+
+    embed = discord.Embed(
+        title="🃏  Duel Poker",
+        description=f"{target.mention}, {ctx.author.mention} te défie pour **{bet:,}** 🪙 !\nAcceptes-tu ? Réponds `oui` ou `non`.",
+        color=COLOR_ORANGE
+    )
+    await ctx.send(embed=embed)
+    def check_a(m): return m.author == target and m.channel == ctx.channel and m.content.lower() in ("oui","non")
+    try:
+        r = await bot.wait_for("message", check=check_a, timeout=30)
+    except asyncio.TimeoutError:
+        return await ctx.send(embed=discord.Embed(description="⏳ Défi expiré.", color=COLOR_RED))
+    if r.content.lower() == "non":
+        return await ctx.send(embed=discord.Embed(description="❌ Défi refusé.", color=COLOR_RED))
+
+    suits_list = ["♠","♥","♦","♣"]
+    ranks_list = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
+    deck = [r+s for r in ranks_list for s in suits_list]
+    random.shuffle(deck)
+
+    hand1 = [deck.pop() for _ in range(5)]
+    hand2 = [deck.pop() for _ in range(5)]
+
+    _, mult1 = poker_hand_name(hand1)
+    name1, _ = poker_hand_name(hand1)
+    _, mult2 = poker_hand_name(hand2)
+    name2, _ = poker_hand_name(hand2)
+
+    result = discord.Embed(title="🃏  Résultat Duel Poker", color=COLOR_CASINO)
+    result.add_field(name=f"🧑 {ctx.author.display_name}  —  {name1}", value=render_hand(hand1), inline=False)
+    result.add_field(name=f"🧑 {target.display_name}  —  {name2}", value=render_hand(hand2), inline=False)
+
+    if mult1 > mult2:
+        challenger["coins"] += bet
+        opponent["coins"] = max(0, opponent["coins"] - bet)
+        challenger["casino_wins"] += 1
+        result.color = COLOR_GREEN
+        result.add_field(name="🏆 Vainqueur !", value=f"{ctx.author.mention} remporte **{bet:,}** 🪙 !", inline=False)
+    elif mult2 > mult1:
+        opponent["coins"] += bet
+        challenger["coins"] = max(0, challenger["coins"] - bet)
+        opponent["casino_wins"] += 1
+        result.color = COLOR_RED
+        result.add_field(name="🏆 Vainqueur !", value=f"{target.mention} remporte **{bet:,}** 🪙 !", inline=False)
+    else:
+        result.color = COLOR_BLUE
+        result.add_field(name="🤝 Égalité !", value="Mises remboursées.", inline=False)
+
+    save_data(data)
+    await ctx.send(embed=result)
 
 # ─── Mini-jeux ────────────────────────────────────────────────────────────────
 
@@ -1088,15 +1941,38 @@ TRIVIA_QUESTIONS = [
     {"q":"Combien d'os le corps humain adulte possède-t-il ?","a":"206","choices":["186","206","226","256"]},
 ]
 
+QUIZ_CATEGORIES = {
+    "sport": [
+        {"q":"Combien de joueurs dans une équipe de foot ?","a":"11","choices":["9","10","11","12"]},
+        {"q":"Dans quel sport utilise-t-on un volant ?","a":"badminton","choices":["Tennis","Badminton","Squash","Ping-pong"]},
+        {"q":"Combien de sets pour gagner à Roland-Garros (hommes) ?","a":"3","choices":["2","3","4","5"]},
+        {"q":"Quel pays a remporté la Coupe du Monde 2018 ?","a":"france","choices":["Brésil","Allemagne","France","Croatie"]},
+    ],
+    "cinema": [
+        {"q":"Qui réalise les films de la saga 'Avengers: Endgame' ?","a":"russo","choices":["Nolan","Spielberg","Russo","Scott"]},
+        {"q":"Dans quel film apparaît le personnage 'Forrest Gump' ?","a":"forrest gump","choices":["Cast Away","Forrest Gump","Rain Man","Big"]},
+        {"q":"Quel acteur joue Iron Man ?","a":"robert downey jr","choices":["Chris Evans","Robert Downey Jr","Mark Ruffalo","Chris Hemsworth"]},
+        {"q":"Quel studio a créé le film 'Toy Story' ?","a":"pixar","choices":["DreamWorks","Pixar","Disney","Sony"]},
+    ],
+    "science": [
+        {"q":"Quelle planète est la plus grande du système solaire ?","a":"jupiter","choices":["Saturne","Jupiter","Neptune","Uranus"]},
+        {"q":"Quel est le plus petit os du corps humain ?","a":"étrier","choices":["Phalange","Étrier","Coccyx","Radius"]},
+        {"q":"À quelle température l'eau bout-elle (°C) ?","a":"100","choices":["90","95","100","110"]},
+        {"q":"Quel gaz les plantes absorbent-elles ?","a":"co2","choices":["O2","H2","CO2","N2"]},
+    ],
+    "histoire": [
+        {"q":"En quelle année a débuté la Première Guerre Mondiale ?","a":"1914","choices":["1910","1912","1914","1916"]},
+        {"q":"Qui était le premier président des États-Unis ?","a":"washington","choices":["Lincoln","Jefferson","Washington","Adams"]},
+        {"q":"Quelle révolution eut lieu en 1789 ?","a":"française","choices":["Américaine","Française","Russe","Industrielle"]},
+        {"q":"Quel mur est tombé en 1989 ?","a":"berlin","choices":["Chine","Berlin","Hadrien","Mexique"]},
+    ],
+}
+
 @bot.command(name="trivia")
 async def trivia(ctx):
     q = random.choice(TRIVIA_QUESTIONS)
     reward_coins = random.randint(40, 150)
-    embed = discord.Embed(
-        title="🧠  Trivia",
-        description=f"**{q['q']}**",
-        color=COLOR_BLUE
-    )
+    embed = discord.Embed(title="🧠  Trivia", description=f"**{q['q']}**", color=COLOR_BLUE)
     choices_str = "\n".join(f"**{i+1}.** {c}" for i,c in enumerate(q["choices"]))
     embed.add_field(name="Choix", value=choices_str, inline=False)
     embed.set_footer(text=f"Réponds avec le numéro (1-4) — ⏳ 20 secondes — Récompense : {reward_coins} 🪙 + 20 XP")
@@ -1128,10 +2004,74 @@ async def trivia(ctx):
         user["coins"] += reward_coins
         user["xp"] += 20
         user["total_earned"] = user.get("total_earned", 0) + reward_coins
+        add_history(user, "🧠 Trivia gagné", reward_coins)
         save_data(data)
         embed = discord.Embed(title="✅  Bonne réponse !", color=COLOR_GREEN)
         embed.add_field(name="💰 Gains", value=f"+**{reward_coins}** 🪙", inline=True)
         embed.add_field(name="⭐ XP", value="+**20** XP", inline=True)
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(embed=discord.Embed(
+            title="❌  Mauvaise réponse !",
+            description=f"La bonne réponse était : **{q['a'].title()}**",
+            color=COLOR_RED
+        ))
+
+@bot.command(name="quiz")
+async def quiz(ctx, category: str = ""):
+    """Quiz par catégorie : sport, cinema, science, histoire."""
+    cat = category.lower()
+    if cat not in QUIZ_CATEGORIES:
+        cats = ", ".join(f"`{c}`" for c in QUIZ_CATEGORIES)
+        return await ctx.send(embed=discord.Embed(
+            title="🧠  Quiz",
+            description=f"Choisis une catégorie : {cats}\nUsage : `%quiz <catégorie>`",
+            color=COLOR_BLUE
+        ))
+    q = random.choice(QUIZ_CATEGORIES[cat])
+    reward_coins = random.randint(60, 200)
+    cat_emojis = {"sport":"⚽","cinema":"🎬","science":"🔬","histoire":"📜"}
+    embed = discord.Embed(
+        title=f"{cat_emojis.get(cat,'🧠')}  Quiz — {cat.title()}",
+        description=f"**{q['q']}**",
+        color=COLOR_PURPLE
+    )
+    choices_str = "\n".join(f"**{i+1}.** {c}" for i,c in enumerate(q["choices"]))
+    embed.add_field(name="Choix", value=choices_str, inline=False)
+    embed.set_footer(text=f"⏳ 20 secondes — Récompense : {reward_coins} 🪙 + 30 XP")
+    await ctx.send(embed=embed)
+
+    def check(m):
+        if m.author != ctx.author or m.channel != ctx.channel: return False
+        try:
+            idx = int(m.content.strip()) - 1
+            return 0 <= idx < len(q["choices"])
+        except:
+            return any(m.content.strip().lower() in c.lower() for c in q["choices"])
+
+    try:
+        resp = await bot.wait_for("message", check=check, timeout=20)
+    except asyncio.TimeoutError:
+        return await ctx.send(embed=discord.Embed(description=f"⏳ Temps écoulé ! La réponse : **{q['a'].title()}**.", color=COLOR_RED))
+
+    ans = resp.content.strip().lower()
+    try:
+        idx = int(ans) - 1
+        given = q["choices"][idx].lower()
+    except:
+        given = ans
+
+    if q["a"].lower() in given or given in q["a"].lower():
+        data = load_data()
+        user = get_user(data, ctx.author.id)
+        user["coins"] += reward_coins
+        user["xp"] += 30
+        user["total_earned"] = user.get("total_earned", 0) + reward_coins
+        add_history(user, f"🧠 Quiz {cat} gagné", reward_coins)
+        save_data(data)
+        embed = discord.Embed(title="✅  Bonne réponse !", color=COLOR_GREEN)
+        embed.add_field(name="💰 Gains", value=f"+**{reward_coins}** 🪙", inline=True)
+        embed.add_field(name="⭐ XP", value="+**30** XP", inline=True)
         await ctx.send(embed=embed)
     else:
         await ctx.send(embed=discord.Embed(
@@ -1172,11 +2112,11 @@ async def rps(ctx, target: discord.Member, mise: str = "0"):
         return await ctx.send(embed=discord.Embed(description="❌ Défi refusé.", color=COLOR_RED))
 
     choices_map = {"pierre":"🪨","feuille":"📄","ciseaux":"✂️","p":"🪨","f":"📄","c":"✂️"}
-    wins = {"pierre":"ciseaux","feuille":"pierre","ciseaux":"feuille"}
+    wins_map = {"pierre":"ciseaux","feuille":"pierre","ciseaux":"feuille"}
 
     async def get_choice(player):
         try:
-            await player.send(f"🎮 **RPS** — Choisis : `pierre`, `feuille` ou `ciseaux`")
+            await player.send("🎮 **RPS** — Choisis : `pierre`, `feuille` ou `ciseaux`")
             def dm_check(m): return m.author == player and isinstance(m.channel, discord.DMChannel) and m.content.lower() in choices_map
             r = await bot.wait_for("message", check=dm_check, timeout=30)
             return r.content.lower()
@@ -1200,7 +2140,7 @@ async def rps(ctx, target: discord.Member, mise: str = "0"):
 
     if c1n == c2n:
         result_embed.add_field(name="🤝 Résultat", value="Égalité ! Mise remboursée.", inline=False)
-    elif wins[c1n] == c2n:
+    elif wins_map[c1n] == c2n:
         challenger["coins"] += bet; opponent["coins"] = max(0, opponent["coins"] - bet)
         challenger["casino_wins"] += 1
         result_embed.color = COLOR_GREEN
@@ -1281,10 +2221,11 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
             line = ""
             for col in range(3):
                 i = row * 3 + col
+                num = str(i+1).center(3)
                 if i in revealed:
-                    line += "💣 " if i in mine_positions else "💎 "
+                    line += "💣  " if i in mine_positions else "💎  "
                 else:
-                    line += "⬛ "
+                    line += f"[{num}]"
             rows.append(line.strip())
         return "\n".join(rows)
 
@@ -1317,7 +2258,6 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         try:
             resp = await bot.wait_for("message", check=check, timeout=60)
         except asyncio.TimeoutError:
-            # Timeout = cashout automatique
             break
 
         content = resp.content.strip().lower()
@@ -1332,13 +2272,12 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         revealed.append(idx)
 
         if idx in mine_positions:
-            # MINE
             user["coins"] = max(0, user["coins"] - bet)
             user["casino_losses"] += 1
-            # Révèle toutes les mines
             for m_idx in mine_positions:
                 if m_idx not in revealed:
                     revealed.append(m_idx)
+            add_history(user, "💣 Mines — boom !", -bet)
             save_data(data)
             e = make_mines_embed("lose")
             e.add_field(name="💥 MINE !", value=f"Perdu **{bet:,}** 🪙", inline=False)
@@ -1348,13 +2287,13 @@ async def mines(ctx, mise: str = "0", cases: int = 3):
         mult = round(1 + (len(revealed) / safe) * (cases * 0.85), 2)
         await ctx.send(embed=make_mines_embed())
 
-    # Cashout
     win = int(bet * mult)
     gain = win - bet
     user["coins"] += gain
     if gain >= 0:
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
+        add_history(user, f"💣 Mines cashout x{mult:.2f}", gain)
     save_data(data)
     e = make_mines_embed("win")
     e.add_field(name="💸 Encaissé !", value=f"x{mult:.2f} → **+{gain:,}** 🪙", inline=False)
@@ -1430,13 +2369,98 @@ async def course(ctx):
             user["coins"] += gain
             user["casino_wins"] += 1
             user["total_earned"] = user.get("total_earned", 0) + gain
+            add_history(user, f"🏇 Course gagnée ({horses[winner_idx]})", gain)
             result_embed.add_field(name=f"🎉 {name}", value=f"+**{gain:,}** 🪙", inline=True)
         else:
             user["coins"] = max(0, user["coins"] - bet_amt)
             user["casino_losses"] += 1
+            add_history(user, f"🏇 Course perdue", -bet_amt)
             result_embed.add_field(name=f"❌ {name}", value=f"-**{bet_amt:,}** 🪙", inline=True)
     save_data(data)
     await ctx.send(embed=result_embed)
+
+# ─── MEMORY (nouveau) ─────────────────────────────────────────────────────────
+
+@bot.command(name="memory")
+async def memory(ctx):
+    """Mémorise une séquence d'emojis qui s'allonge à chaque round."""
+    emojis = ["🍎","🍌","🍇","🍓","🍑","🍒","🍋","🍉"]
+    sequence = []
+    score = 0
+
+    embed = discord.Embed(
+        title="🧠  Memory",
+        description="Mémorise la séquence et réponds avec les **numéros** dans l'ordre !\nEx : `1 3 2 4`",
+        color=COLOR_PURPLE
+    )
+    embed.set_footer(text="Chaque round ajoute un emoji. Récompense : 20 🪙 × rounds réussis")
+    await ctx.send(embed=embed)
+    await asyncio.sleep(2)
+
+    for round_n in range(1, 7):
+        new_emoji = random.choice(emojis)
+        sequence.append(new_emoji)
+        indexed = " ".join(f"**{i+1}**={e}" for i, e in enumerate(emojis))
+        seq_display = "  ".join(sequence)
+
+        # Montre la séquence
+        show = discord.Embed(
+            title=f"🧠  Round {round_n} — Mémorise !",
+            description=f"```\n{seq_display}\n```",
+            color=COLOR_PURPLE
+        )
+        show.add_field(name="Référence", value=indexed, inline=False)
+        msg = await ctx.send(embed=show)
+        await asyncio.sleep(max(2, 4 - round_n * 0.3))
+
+        # Cache la séquence
+        hide = discord.Embed(
+            title=f"🧠  Round {round_n} — À toi !",
+            description="La séquence est cachée. Tape les numéros dans l'ordre.",
+            color=COLOR_CASINO
+        )
+        hide.add_field(name="Référence", value=indexed, inline=False)
+        await msg.edit(embed=hide)
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            resp = await bot.wait_for("message", check=check, timeout=20)
+        except asyncio.TimeoutError:
+            break
+
+        try:
+            given = [int(x)-1 for x in resp.content.strip().split()]
+            expected = [emojis.index(e) for e in sequence]
+        except:
+            break
+
+        if given == expected:
+            score += 1
+            await ctx.send(embed=discord.Embed(description=f"✅ **Round {round_n} réussi !** Continue...", color=COLOR_GREEN))
+            await asyncio.sleep(1)
+        else:
+            break
+
+    reward = score * 20
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    user["coins"] += reward
+    user["xp"] += score * 5
+    user["total_earned"] = user.get("total_earned", 0) + reward
+    if reward > 0:
+        add_history(user, f"🧠 Memory {score} rounds", reward)
+    save_data(data)
+
+    result = discord.Embed(
+        title="🧠  Memory — Terminé !",
+        description=f"Tu as réussi **{score}** round(s) !",
+        color=COLOR_GREEN if score >= 3 else COLOR_ORANGE
+    )
+    result.add_field(name="💰 Gains", value=f"+**{reward}** 🪙", inline=True)
+    result.add_field(name="⭐ XP", value=f"+**{score*5}** XP", inline=True)
+    await ctx.send(embed=result)
 
 WORDGAME_WORDS = [
     ("PYTHON", "🐍 Langage de programmation célèbre"),
@@ -1453,7 +2477,6 @@ WORDGAME_WORDS = [
 
 @bot.command(name="wordgame", aliases=["mot", "pendu"])
 async def wordgame(ctx):
-    """Jeu du pendu / devinette de mot"""
     word, hint = random.choice(WORDGAME_WORDS)
     reward = len(word) * 20
     xp_reward = len(word) * 5
@@ -1461,16 +2484,16 @@ async def wordgame(ctx):
     hidden = ["_"] * len(word)
     guessed = []
     lives = 6
-    life_icons = ["❤️","❤️","❤️","❤️","❤️","❤️"]
+    hangman_stages = ["😊","😐","😟","😰","😨","😱","💀"]
 
     def display():
         return " ".join(hidden)
 
     def make_embed():
         e = discord.Embed(title="🔤  Jeu de Mots", color=COLOR_PURPLE)
-        e.add_field(name="Mot", value=f"```{display()}```", inline=False)
+        e.add_field(name="Mot", value=f"```\n{display()}\n```", inline=False)
         e.add_field(name="💡 Indice", value=hint, inline=True)
-        e.add_field(name="❤️ Vies", value=" ".join(life_icons[:lives]), inline=True)
+        e.add_field(name=f"{hangman_stages[6-lives]} Vies", value=f"**{lives}/6**", inline=True)
         if guessed:
             e.add_field(name="🔡 Lettres essayées", value=" ".join(sorted(guessed)), inline=False)
         e.set_footer(text=f"Réponds avec une lettre ou le mot complet | Récompense : {reward} 🪙")
@@ -1517,6 +2540,7 @@ async def wordgame(ctx):
         user["coins"] += reward
         user["xp"] += xp_reward
         user["total_earned"] = user.get("total_earned", 0) + reward
+        add_history(user, f"🔤 WordGame gagné ({word})", reward)
         save_data(data)
         embed = discord.Embed(title="✅  Bravo !", description=f"Le mot était **{word}** !", color=COLOR_GREEN)
         embed.add_field(name="💰 Gains", value=f"+**{reward}** 🪙", inline=True)
@@ -1528,6 +2552,65 @@ async def wordgame(ctx):
             description=f"Le mot était **{word}**. Plus de vies !",
             color=COLOR_RED
         ))
+
+# ─── MARCHÉ NOIR (nouveau) ────────────────────────────────────────────────────
+
+@bot.command(name="blackmarket", aliases=["marche", "marchenoir"])
+async def blackmarket_cmd(ctx):
+    """Marché noir — items à prix réduit, stock limité, refresh toutes les 6h."""
+    refresh_blackmarket()
+    now = time.time()
+    next_refresh = blackmarket_state["last_refresh"] + 21600 - now
+
+    embed = discord.Embed(
+        title="🕵️  Marché Noir",
+        description=f"Stock limité ! Prochain refresh dans **{format_time(next_refresh)}**\nAchète avec `%bm <numéro>`",
+        color=0x1A1A2E
+    )
+    for i, item in enumerate(blackmarket_state["items"]):
+        stock = blackmarket_state["stocks"].get(item["key"], 0)
+        embed.add_field(
+            name=f"**{i+1}.** {item['emoji']} {item['name']}",
+            value=f"Prix : **{item['price']:,}** 🪙  (-{item['discount']}%)\nStock : **{stock}** restant(s)",
+            inline=False
+        )
+    embed.set_footer(text="⚠️ Ces items ne sont pas disponibles en boutique officielle !")
+    await ctx.send(embed=embed)
+
+@bot.command(name="bm")
+async def bm_buy(ctx, numero: int = 0):
+    """Acheter un item au marché noir."""
+    refresh_blackmarket()
+    items = blackmarket_state["items"]
+    if numero < 1 or numero > len(items):
+        return await ctx.send(embed=discord.Embed(description=f"❌ Numéro invalide. Utilise `%blackmarket` pour voir les items.", color=COLOR_RED))
+
+    item = items[numero - 1]
+    stock = blackmarket_state["stocks"].get(item["key"], 0)
+    if stock <= 0:
+        return await ctx.send(embed=discord.Embed(description="❌ Cet item est en rupture de stock !", color=COLOR_RED))
+
+    data = load_data()
+    user = get_user(data, ctx.author.id)
+    if user["coins"] < item["price"]:
+        return await ctx.send(embed=discord.Embed(
+            description=f"❌ Pas assez de coins. Il te faut **{item['price']:,}** 🪙.",
+            color=COLOR_RED
+        ))
+
+    user["coins"] -= item["price"]
+    user["inventory"].append(item["key"])
+    blackmarket_state["stocks"][item["key"]] = stock - 1
+    add_history(user, f"🕵️ Marché Noir: {item['name']}", -item["price"])
+    save_data(data)
+
+    embed = discord.Embed(
+        title="✅  Achat au Marché Noir !",
+        description=f"Tu as acheté **{item['emoji']} {item['name']}** pour **{item['price']:,}** 🪙 !",
+        color=COLOR_GREEN
+    )
+    embed.set_footer(text=f"Utilise %use {item['key']} pour l'activer")
+    await ctx.send(embed=embed)
 
 # ─── Shop ─────────────────────────────────────────────────────────────────────
 
@@ -1544,7 +2627,7 @@ async def shop(ctx):
             value=f"{item['description']}\n`%buy {key}`",
             inline=False
         )
-    embed.set_footer(text="Utilise %buy <clé> pour acheter • %inventaire pour voir tes items")
+    embed.set_footer(text="Utilise %buy <clé> pour acheter • %inventaire pour voir tes items • %blackmarket pour le marché noir")
     await ctx.send(embed=embed)
 
 @bot.command(name="buy", aliases=["acheter"])
@@ -1593,6 +2676,7 @@ async def buy(ctx, item_key: str = ""):
     else:
         user["coins"] -= item["price"]
         user["inventory"].append(item_key)
+        add_history(user, f"🛒 Achat: {item['name']}", -item["price"])
         save_data(data)
         embed = discord.Embed(
             title="✅  Achat réussi !",
@@ -1610,7 +2694,7 @@ async def inventaire(ctx):
     if not user["inventory"]:
         return await ctx.send(embed=discord.Embed(
             title="🎒  Inventaire",
-            description="Ton inventaire est vide.\nAchète des items avec `%shop` !",
+            description="Ton inventaire est vide.\nAchète des items avec `%shop` ou `%blackmarket` !",
             color=COLOR_PURPLE
         ))
     embed = discord.Embed(title=f"🎒  Inventaire de {ctx.author.display_name}", color=COLOR_PURPLE)
