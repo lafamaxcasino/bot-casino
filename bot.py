@@ -968,93 +968,90 @@ async def crash(ctx, mise: str = "0"):
     else:
         crash_at = round(random.uniform(10.0, 50.0), 2)
 
-    embed = discord.Embed(
-        title="📈  Crash",
-        description=(
-            f"**Mise : {bet:,} 🪙**\n\n"
-            f"Le multiplicateur monte ! Tape `stop` pour encaisser avant le crash !\n"
-            f"⚠️ Tu as **20 secondes** max."
-        ),
-        color=COLOR_CASINO
-    )
-    embed.add_field(name="📊 Multiplicateur", value="**x1.00** 🚀", inline=True)
-    embed.add_field(name="💰 Valeur actuelle", value=f"**{bet:,}** 🪙", inline=True)
-    embed.set_footer(text="Tape 'stop' pour encaisser !")
-    msg = await ctx.send(embed=embed)
+    def make_crash_embed(mult: float, crashed: bool = False):
+        val = int(bet * mult)
+        if crashed:
+            e = discord.Embed(title="💥  CRASH !", color=COLOR_RED)
+        else:
+            e = discord.Embed(title="📈  Crash — En cours...", color=COLOR_CASINO)
+        e.add_field(name="📊 Multiplicateur", value=f"**x{mult:.2f}** {'💥' if crashed else '🚀'}", inline=True)
+        e.add_field(name="💰 Valeur actuelle", value=f"**{val:,}** 🪙", inline=True)
+        e.add_field(name="💵 Mise", value=f"**{bet:,}** 🪙", inline=True)
+        if not crashed:
+            e.set_footer(text="Tape 'stop' pour encaisser !")
+        return e
+
+    # Envoie UN seul embed dès le départ
+    msg = await ctx.send(embed=make_crash_embed(1.0))
 
     current_mult = 1.0
+    step = 0.10
     cashed_out = False
-    start_time = time.time()
+    stop_mult = None
 
-    def check(m):
-        return (
-            m.author == ctx.author and
-            m.channel == ctx.channel and
-            m.content.strip().lower() in ("stop", "cashout", "encaisser", "cash")
-        )
+    # Boucle principale : on avance le mult, on édite l'embed, on vérifie les messages
+    while True:
+        # Attente entre chaque tick — pendant ce temps on écoute les messages
+        try:
+            resp = await asyncio.wait_for(
+                bot.wait_for(
+                    "message",
+                    check=lambda m: (
+                        m.author == ctx.author and
+                        m.channel == ctx.channel and
+                        m.content.strip().lower() in ("stop", "cashout", "encaisser", "cash")
+                    )
+                ),
+                timeout=1.5
+            )
+            # Le joueur a tapé stop
+            cashed_out = True
+            stop_mult = current_mult
+            break
+        except asyncio.TimeoutError:
+            pass  # Pas de stop, on continue
 
-    async def update_loop():
-        nonlocal current_mult, cashed_out
-        step = 0.10
-        while current_mult < crash_at and not cashed_out:
-            await asyncio.sleep(1.5)
-            if cashed_out:
-                break
-            current_mult = round(current_mult + step, 2)
-            step = round(step * 1.05, 3)  # accélération progressive
-            if current_mult >= crash_at:
-                break
-            val = int(bet * current_mult)
-            new_embed = discord.Embed(title="📈  Crash — En cours...", color=COLOR_CASINO)
-            new_embed.add_field(name="📊 Multiplicateur", value=f"**x{current_mult:.2f}** 🚀", inline=True)
-            new_embed.add_field(name="💰 Valeur actuelle", value=f"**{val:,}** 🪙", inline=True)
-            new_embed.set_footer(text="Tape 'stop' pour encaisser !")
-            try:
-                await msg.edit(embed=new_embed)
-            except:
-                pass
+        # Avance le multiplicateur
+        current_mult = round(current_mult + step, 2)
+        step = round(step * 1.06, 3)  # accélération progressive
 
-    update_task = asyncio.create_task(update_loop())
+        if current_mult >= crash_at:
+            current_mult = crash_at
+            # Crash ! On édite l'embed avec l'état final crashé
+            await msg.edit(embed=make_crash_embed(current_mult, crashed=True))
+            break
 
-    try:
-        elapsed = time.time() - start_time
-        remaining = max(1, 20 - int(elapsed))
-        await bot.wait_for("message", check=check, timeout=remaining)
-        cashed_out = True
-        update_task.cancel()
-    except asyncio.TimeoutError:
-        cashed_out = False
+        # Mise à jour de l'embed (edit, pas nouveau message)
+        await msg.edit(embed=make_crash_embed(current_mult))
 
-    await asyncio.sleep(0.5)
-
-    if cashed_out and current_mult < crash_at:
-        win = int(bet * current_mult)
+    # Résultat
+    if cashed_out:
+        mult_used = stop_mult
+        win = int(bet * mult_used)
         gain = win - bet
         user["coins"] += gain
         user["casino_wins"] += 1
         user["total_earned"] = user.get("total_earned", 0) + gain
         result_embed = discord.Embed(
-            title="💸  Crash — Cashout !",
-            description=f"Tu as encaissé à **x{current_mult:.2f}** !\n_(Le crash était à x{crash_at:.2f})_",
+            title="💸  Cashout !",
+            description=f"Tu as encaissé à **x{mult_used:.2f}** !\n*Le crash était à x{crash_at:.2f}*",
             color=COLOR_GREEN
         )
         result_embed.add_field(name="💰 Gains", value=f"+**{gain:,}** 🪙", inline=True)
         result_embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
     else:
-        # Vérifie si l'assurance est active
-        loss = bet
+        # Crash sans cashout
         if user.get("insurance"):
             refund = bet // 2
             user["coins"] = max(0, user["coins"] - bet + refund)
             user["insurance"] = False
-            loss = bet - refund
             result_embed = discord.Embed(
                 title="💥  Crash !",
-                description=f"CRASH à **x{crash_at:.2f}** !\n🔒 Assurance activée — remboursement partiel.",
+                description=f"Crash à **x{crash_at:.2f}** !\n🔒 Assurance activée — remboursement partiel.",
                 color=COLOR_ORANGE
             )
-            result_embed.add_field(name="❌ Perte nette", value=f"-**{loss:,}** 🪙", inline=True)
-            result_embed.add_field(name="🔒 Remboursement", value=f"+**{refund:,}** 🪙", inline=True)
+            result_embed.add_field(name="❌ Perte nette", value=f"-**{bet - refund:,}** 🪙", inline=True)
+            result_embed.add_field(name="🔒 Remboursé", value=f"+**{refund:,}** 🪙", inline=True)
         else:
             user["coins"] = max(0, user["coins"] - bet)
             result_embed = discord.Embed(
@@ -1067,7 +1064,8 @@ async def crash(ctx, mise: str = "0"):
         result_embed.add_field(name="💳 Solde", value=f"**{user['coins']:,}** 🪙", inline=True)
 
     save_data(data)
-    await ctx.send(embed=result_embed)
+    # On édite le message existant avec le résultat final (toujours 1 seul message)
+    await msg.edit(embed=result_embed)
 
 # ─── Mini-jeux ────────────────────────────────────────────────────────────────
 
