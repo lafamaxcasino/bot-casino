@@ -184,7 +184,8 @@ vocal_sessions: dict[int, float] = {}
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} est connecté !")
-    vocal_xp_loop.start()
+    if not vocal_xp_loop.is_running():
+        vocal_xp_loop.start()
 
 @bot.event
 async def on_message(message: discord.Message):
